@@ -1,4 +1,4 @@
-name: Build card rotation APK
+name: Build card rotation APK (all Pro features unlocked)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -17,10 +17,33 @@ jobs:
           git apply --check "$PATCH"
           git apply "$PATCH"
 
+      - name: Install next to the original app (id ends with .mine)
+        run: |
+          sed -i '/^        release {/a\            applicationIdSuffix = ".mine"' app/build.gradle.kts
+          grep -n 'applicationIdSuffix' app/build.gradle.kts
+
       - uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
+
+      - name: Signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "Using your saved signing key"
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/rotation.jks"
+          else
+            echo "No saved key, making a temporary one (updates will need an uninstall first)"
+            keytool -genkeypair -keystore "$RUNNER_TEMP/rotation.jks" -alias rotation -keyalg RSA -keysize 2048 -validity 10000 -storepass rotation123 -keypass rotation123 -dname "CN=Card Rotation, O=Personal"
+          fi
+          {
+            echo "RELEASE_STORE_FILE=$RUNNER_TEMP/rotation.jks"
+            echo "RELEASE_STORE_PASSWORD=rotation123"
+            echo "RELEASE_KEY_ALIAS=rotation"
+            echo "RELEASE_KEY_PASSWORD=rotation123"
+          } >> local.properties
 
       - uses: android-actions/setup-android@v3
         with:
@@ -28,11 +51,41 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --build-cache
+      - name: Run the rotation tests (no APK is built if one fails)
+        run: ./gradlew :app:testFdroidDebugUnitTest --tests "com.pennywiseai.tracker.domain.rotation.*" --build-cache
+
+      - name: Keep the test report if tests failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: app/build/reports/tests/
+          retention-days: 7
+
+      # The project's own F-Droid build: every Pro feature is on (unlimited rules, statement imports, CSV
+      # export, account merge, goals). No license check is changed or bypassed.
+      - name: Build release APK (F-Droid variant)
+        run: ./gradlew :app:assembleFdroidRelease --build-cache
+
+      - name: Make sure the APK is signed
+        run: |
+          DIR=app/build/outputs/apk/fdroid/release
+          ls -la "$DIR"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          for f in "$DIR"/*.apk; do
+            if "$BT/apksigner" verify "$f" >/dev/null 2>&1; then
+              echo "Already signed: $f"
+            else
+              echo "Signing: $f"
+              "$BT/apksigner" sign --ks "$RUNNER_TEMP/rotation.jks" --ks-pass pass:rotation123 --key-pass pass:rotation123 --out "${f%.apk}-signed.apk" "$f"
+              rm "$f"
+            fi
+          done
+          ls -la "$DIR"
 
       - uses: actions/upload-artifact@v4
         with:
           name: card-rotation-apk
-          path: app/build/outputs/apk/standard/debug/*.apk
+          path: app/build/outputs/apk/fdroid/release/*.apk
           retention-days: 14
+
