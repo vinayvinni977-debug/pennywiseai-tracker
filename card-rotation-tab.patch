@@ -1,0 +1,1526 @@
+diff --git a/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt b/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt
+index d1d3bc9..b4cbb7f 100644
+--- a/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt
++++ b/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt
+@@ -35,6 +35,9 @@ class MainActivity : FragmentActivity() {
+         const val EXTRA_OPEN_BUDGETS = "com.pennywiseai.tracker.OPEN_BUDGETS"
+         const val EXTRA_CREATE_GOAL = "com.pennywiseai.tracker.CREATE_GOAL"
+ 
++        /** "Was a credit missed?" reminder: open the Card rotation screen. */
++        const val EXTRA_OPEN_CARD_ROTATION = "com.pennywiseai.tracker.OPEN_CARD_ROTATION"
++
+         /**
+          * Deep link that jumps straight to Add Transaction: `pennywise://add`.
+          * The single entry point every quick-add surface routes through — the
+@@ -109,6 +112,7 @@ class MainActivity : FragmentActivity() {
+         val goalId = intent.getLongExtra(EXTRA_OPEN_GOAL_ID, -1L)
+         widgetDestination = when {
+             goalId > 0 -> com.pennywiseai.tracker.navigation.GoalDetail(goalId)
++            intent.getBooleanExtra(EXTRA_OPEN_CARD_ROTATION, false) -> com.pennywiseai.tracker.navigation.CardRotation
+             intent.getBooleanExtra(EXTRA_OPEN_BUDGETS, false) ->
+                 com.pennywiseai.tracker.navigation.BudgetGroups(createGoal = intent.getBooleanExtra(EXTRA_CREATE_GOAL, false))
+             else -> return
+diff --git a/app/src/main/java/com/pennywiseai/tracker/PennyWiseApplication.kt b/app/src/main/java/com/pennywiseai/tracker/PennyWiseApplication.kt
+index ee190e0..c8faf85 100644
+--- a/app/src/main/java/com/pennywiseai/tracker/PennyWiseApplication.kt
++++ b/app/src/main/java/com/pennywiseai/tracker/PennyWiseApplication.kt
+@@ -91,6 +91,8 @@ class PennyWiseApplication : Application(), Configuration.Provider {
+         // off still creates anything that came due while it was down.
+         com.pennywiseai.tracker.worker.RecurringTransactionWorker.enqueuePeriodic(this)
+         com.pennywiseai.tracker.worker.RecurringTransactionWorker.enqueueOneShotCatchUp(this)
++        // Hourly: ask about card spends that never got a bank credit (switch lives on the Card rotation screen).
++        com.pennywiseai.tracker.worker.CardCreditCheckWorker.enqueuePeriodic(this)
+         // The evening recap is opt-in: scheduled only while its switch is on.
+         applicationScope.launch {
+             com.pennywiseai.tracker.worker.DailySummaryWorker.sync(
+diff --git a/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardRotation.kt b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardRotation.kt
+new file mode 100644
+index 0000000..3079540
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardRotation.kt
+@@ -0,0 +1,307 @@
++package com.pennywiseai.tracker.domain.rotation
++
++import java.math.BigDecimal
++import java.math.RoundingMode
++import java.time.Duration
++import java.time.LocalDateTime
++
++/**
++ * Card rotation: spend on a credit card through a payment gateway (Cashfree,
++ * Razorpay, ...) so that the money lands in your own bank account, minus a fee.
++ *
++ *   card purchase  ₹50,584.10  (merchant "Cas*..." )
++ *   bank credit    ₹50,000.00  ("Cashfree Payments in your a/c")
++ *   charges        ₹   584.10  (0.99% + 18% GST)
++ *
++ * That is neither income nor an expense: only the charges are a real cost. This
++ * file is deliberately free of Android / Room types so it can be unit-tested on
++ * the JVM; the ViewModel maps TransactionEntity -> [RotationTxn].
++ */
++
++enum class RotationKind {
++    /** Purchase on a credit card (TransactionType.CREDIT). */
++    CARD_PURCHASE,
++
++    /** Money received in an account (TransactionType.INCOME). */
++    INCOMING,
++
++    /** Money leaving a bank account (TransactionType.EXPENSE). */
++    OUTGOING,
++
++    /** Anything else; ignored. */
++    OTHER,
++}
++
++data class RotationTxn(
++    val id: Long,
++    val amount: BigDecimal,
++    val merchant: String,
++    val kind: RotationKind,
++    val dateTime: LocalDateTime,
++    val bankName: String? = null,
++    val account: String? = null,
++    /** Free text used to find a card's last 4 digits in a bill-payment debit. */
++    val text: String = "",
++)
++
++data class CardKey(val bank: String, val last4: String) {
++    val label: String get() = if (last4.isBlank()) bank else "$bank ••$last4"
++}
++
++/** What the money was used for when the bank credit SMS is missing. */
++enum class OnwardUse {
++    /** Paid to another card / own account: neither leg is spending. */
++    TRANSFER,
++
++    /** A real expense (rent, a bill...): only the card leg is a rotation, the debit stays an expense. */
++    EXPENSE,
++}
++
++/** User-confirmed link between a card purchase and the bank debit that followed it (credit SMS missing). */
++data class ManualLink(val outId: Long, val onwardId: Long, val use: OnwardUse)
++
++data class RotationPair(
++    val outId: Long,
++    val inId: Long,
++    val card: CardKey,
++    val spent: BigDecimal,
++    val received: BigDecimal,
++    val charges: BigDecimal,
++    val at: LocalDateTime,
++    /** True when the bank credit is missing and [inId] is the later debit; charges are then an estimate. */
++    val inferred: Boolean = false,
++    /** Whether the second row is excluded from totals (false for an inferred link whose debit is a real expense). */
++    val excludeIn: Boolean = true,
++)
++
++/** A card spend with no credit and no plausible onward debit: the app asks "was a credit missed?". */
++data class UnmatchedSpend(
++    val outId: Long,
++    val card: CardKey,
++    val merchant: String,
++    val spent: BigDecimal,
++    val at: LocalDateTime,
++)
++
++/** An unconfirmed guess: card purchase followed by a bank debit of nearly the same amount. */
++data class RotationSuggestion(
++    val outId: Long,
++    val onwardId: Long,
++    val card: CardKey,
++    val spent: BigDecimal,
++    val onward: BigDecimal,
++    val estCharges: BigDecimal,
++    val at: LocalDateTime,
++    val onwardAt: LocalDateTime,
++    /** The debit text looks like a credit-card bill payment, so TRANSFER is the likely answer. */
++    val looksLikeCardBill: Boolean,
++)
++
++data class CardLedger(
++    val card: CardKey,
++    val rotations: List<RotationPair>,
++    val rotated: BigDecimal,
++    val received: BigDecimal,
++    val charges: BigDecimal,
++    /** charges as a percentage of the amount received (e.g. 1.17). */
++    val chargePct: BigDecimal,
++    /** Bank-side card-bill payments assigned to this card since its first rotation. */
++    val repaid: BigDecimal,
++    /** rotated - repaid, never below zero. An estimate: repayments also settle normal spends. */
++    val stillToRepay: BigDecimal,
++    val repaymentIds: List<Long>,
++    /** True when at least one rotation is inferred, so received/charges are estimates. */
++    val hasEstimates: Boolean = false,
++)
++
++data class RotationReport(
++    val cards: List<CardLedger>,
++    val suggestions: List<RotationSuggestion> = emptyList(),
++    /** Card spends to ask the user about (no credit found, not dismissed). */
++    val needsCredit: List<UnmatchedSpend> = emptyList(),
++    /** Card-bill payments we could not tie to a specific card. */
++    val unassignedRepaymentIds: List<Long>,
++    val unassignedRepaid: BigDecimal,
++) {
++    val totalRotated: BigDecimal get() = cards.fold(BigDecimal.ZERO) { a, c -> a + c.rotated }
++    val totalReceived: BigDecimal get() = cards.fold(BigDecimal.ZERO) { a, c -> a + c.received }
++    val totalCharges: BigDecimal get() = cards.fold(BigDecimal.ZERO) { a, c -> a + c.charges }
++
++    /** Ids of every row that must be excluded from income/expense totals because of a rotation. */
++    val pairedIds: Set<Long>
++        get() = cards.flatMap { c -> c.rotations.flatMap { p -> if (p.excludeIn) listOf(p.outId, p.inId) else listOf(p.outId) } }.toSet()
++}
++
++object CardRotation {
++
++    /** Merchant name given to the credit row the user enters by hand; it also counts as a gateway marker. */
++    const val MANUAL_CREDIT_MERCHANT = "Card rotation credit"
++
++    /** Gateway markers, matched case-insensitively. `\b` keeps "cred" out of "credit"/"credited". */
++    val DEFAULT_GATEWAYS: List<Regex> = listOf(
++        "^cas\\*", "\\bcashfree\\b", "\\brazorpay\\b", "^razp\\*", "\\bpayu\\b", "\\bbilldesk\\b",
++        "\\bpaytm\\b", "\\bphonepe\\b", "\\bcred\\b", "\\bmobikwik\\b", "\\bfreecharge\\b",
++        "\\bjuspay\\b", "\\bcard rotation\\b", "\\bccavenue\\b", "\\binstamojo\\b", "\\beasebuzz\\b", "\\bcashgram\\b",
++    ).map { Regex(it, RegexOption.IGNORE_CASE) }
++
++    /** Words that mark a bank debit as a credit-card bill payment. */
++    val CARD_BILL_WORDS: Regex =
++        Regex("credit\\s*card|\\bcc\\s*(bill|payment)|card\\s*(bill|payment|dues)", RegexOption.IGNORE_CASE)
++
++    fun analyze(
++        txns: List<RotationTxn>,
++        gateways: List<Regex> = DEFAULT_GATEWAYS,
++        windowMinutes: Long = 48L * 60L,
++        maxChargePct: BigDecimal = BigDecimal("5"),
++        links: List<ManualLink> = emptyList(),
++        dismissedOutIds: Set<Long> = emptySet(),
++        suggestWindowMinutes: Long = 12L * 60L,
++        askMinAmount: BigDecimal = BigDecimal.ZERO,
++        askWithinDays: Long = 60L,
++        asOf: LocalDateTime = LocalDateTime.now(),
++    ): RotationReport {
++        val incoming = txns.filter { it.kind == RotationKind.INCOMING }
++        val claimed = HashSet<Long>()
++        val pairs = ArrayList<RotationPair>()
++
++        fun isGateway(s: String) = gateways.any { it.containsMatchIn(s.trim()) }
++
++        for (out in txns.filter { it.kind == RotationKind.CARD_PURCHASE }.sortedBy { it.dateTime }) {
++            val best = incoming
++                .asSequence()
++                .filter { it.id !in claimed }
++                .filter { it.amount.signum() > 0 && it.amount <= out.amount }
++                .filter { sameAccountNotAllowed(out, it) }
++                .filter { Duration.between(out.dateTime, it.dateTime).abs().toMinutes() <= windowMinutes }
++                .filter { isManualCredit(it) || chargePct(out.amount, it.amount) <= maxChargePct }
++                // a rotation needs a gateway on at least one side; plain coincidences stay as they are
++                .filter { isGateway(out.merchant) || isGateway(it.merchant) || isGateway(it.text) }
++                .minByOrNull { Duration.between(out.dateTime, it.dateTime).abs().toMinutes() }
++                ?: continue
++            claimed += best.id
++            pairs += RotationPair(
++                outId = out.id,
++                inId = best.id,
++                card = cardKey(out),
++                spent = out.amount,
++                received = best.amount,
++                charges = out.amount - best.amount,
++                at = out.dateTime,
++            )
++        }
++
++        // Credit SMS missing: the user confirmed "this card spend was followed by this debit".
++        val byId = txns.associateBy { it.id }
++        val usedOut = pairs.map { it.outId }.toMutableSet()
++        val usedOnward = HashSet<Long>()
++        for (l in links) {
++            val out = byId[l.outId]?.takeIf { it.kind == RotationKind.CARD_PURCHASE && it.id !in usedOut } ?: continue
++            val onward = byId[l.onwardId]?.takeIf { it.kind == RotationKind.OUTGOING && it.id !in claimed && it.id !in usedOnward } ?: continue
++            val diff = (out.amount - onward.amount).max(BigDecimal.ZERO)
++            usedOut += out.id
++            usedOnward += onward.id
++            pairs += RotationPair(
++                outId = out.id, inId = onward.id, card = cardKey(out),
++                spent = out.amount, received = onward.amount.min(out.amount), charges = diff, at = out.dateTime,
++                inferred = true, excludeIn = l.use == OnwardUse.TRANSFER,
++            )
++        }
++
++        val suggestions = ArrayList<RotationSuggestion>()
++        val suggestedOnward = HashSet<Long>()
++        val bankDebits = txns.filter { it.kind == RotationKind.OUTGOING }
++        for (out in txns.filter { it.kind == RotationKind.CARD_PURCHASE }.sortedBy { it.dateTime }) {
++            if (out.id in usedOut || out.id in dismissedOutIds) continue
++            val onward = bankDebits
++                .asSequence()
++                .filter { it.id !in claimed && it.id !in usedOnward && it.id !in suggestedOnward }
++                .filter { it.amount.signum() > 0 && it.amount <= out.amount }
++                .filter { chargePct(out.amount, it.amount) <= maxChargePct }
++                // the debit follows the card spend (5 min of SMS clock skew allowed)
++                .filter { !it.dateTime.isBefore(out.dateTime.minusMinutes(5)) }
++                .filter { Duration.between(out.dateTime, it.dateTime).toMinutes() <= suggestWindowMinutes }
++                .minByOrNull { Duration.between(out.dateTime, it.dateTime).abs().toMinutes() }
++                ?: continue
++            suggestedOnward += onward.id
++            suggestions += RotationSuggestion(
++                outId = out.id, onwardId = onward.id, card = cardKey(out), spent = out.amount, onward = onward.amount,
++                estCharges = out.amount - onward.amount, at = out.dateTime, onwardAt = onward.dateTime,
++                looksLikeCardBill = looksLikeCardBill(onward),
++            )
++        }
++
++        val suggestedOut = suggestions.map { it.outId }.toSet()
++        val since = asOf.minusDays(askWithinDays)
++        val needsCredit = txns
++            .filter { it.kind == RotationKind.CARD_PURCHASE }
++            .filter { it.id !in usedOut && it.id !in suggestedOut && it.id !in dismissedOutIds }
++            .filter { it.amount >= askMinAmount && !it.dateTime.isBefore(since) }
++            .sortedByDescending { it.dateTime }
++            .map { UnmatchedSpend(it.id, cardKey(it), it.merchant, it.amount, it.dateTime) }
++
++        val cardKeys = pairs.map { it.card }.distinct()
++        val firstRotation = pairs.groupBy { it.card }.mapValues { (_, v) -> v.minOf { it.at } }
++
++        // Card-bill payments leave a bank account; the card-side "payment received" SMS is skipped by parsers.
++        val repayments = txns.filter { it.kind == RotationKind.OUTGOING && looksLikeCardBill(it) }
++        val assigned = HashMap<CardKey, MutableList<RotationTxn>>()
++        val unassigned = ArrayList<RotationTxn>()
++        for (r in repayments) {
++            val haystack = "${r.merchant} ${r.text}"
++            val card = cardKeys
++                .filter { it.last4.isNotBlank() && Regex("(?<!\\d)${it.last4}(?!\\d)").containsMatchIn(haystack) }
++                .singleOrNull()
++            if (card == null) unassigned += r else assigned.getOrPut(card) { ArrayList() } += r
++        }
++
++        val ledgers = pairs.groupBy { it.card }.map { (card, ps) ->
++            val rotated = ps.fold(BigDecimal.ZERO) { a, p -> a + p.spent }
++            val received = ps.fold(BigDecimal.ZERO) { a, p -> a + p.received }
++            val charges = rotated - received
++            val since = firstRotation.getValue(card)
++            val reps = assigned[card].orEmpty().filter { !it.dateTime.isBefore(since) }
++            val repaid = reps.fold(BigDecimal.ZERO) { a, r -> a + r.amount }
++            CardLedger(
++                card = card,
++                rotations = ps.sortedBy { it.at },
++                rotated = rotated,
++                received = received,
++                charges = charges,
++                chargePct = pct(charges, received),
++                repaid = repaid,
++                stillToRepay = (rotated - repaid).max(BigDecimal.ZERO),
++                repaymentIds = reps.map { it.id },
++                hasEstimates = ps.any { it.inferred },
++            )
++        }.sortedByDescending { it.rotated }
++
++        return RotationReport(
++            cards = ledgers,
++            suggestions = suggestions,
++            needsCredit = needsCredit,
++            unassignedRepaymentIds = unassigned.map { it.id },
++            unassignedRepaid = unassigned.fold(BigDecimal.ZERO) { a, r -> a + r.amount },
++        )
++    }
++
++    private fun isManualCredit(t: RotationTxn) = t.merchant.equals(MANUAL_CREDIT_MERCHANT, ignoreCase = true)
++
++    private fun looksLikeCardBill(t: RotationTxn) = CARD_BILL_WORDS.containsMatchIn("${t.merchant} ${t.text}")
++
++    private fun digits(s: String?) = s.orEmpty().filter { it.isDigit() }
++
++    private fun cardKey(t: RotationTxn) = CardKey(t.bankName?.takeIf { it.isNotBlank() } ?: "Card", digits(t.account).takeLast(4))
++
++    /** A rotation moves money to a *different* account; unknown accounts are allowed (like the transfer detector). */
++    private fun sameAccountNotAllowed(a: RotationTxn, b: RotationTxn): Boolean {
++        val x = digits(a.account).takeLast(4)
++        val y = digits(b.account).takeLast(4)
++        return x.isEmpty() || y.isEmpty() || x != y || !a.bankName.equals(b.bankName, ignoreCase = true)
++    }
++
++    private fun chargePct(spent: BigDecimal, received: BigDecimal) = pct(spent - received, received)
++
++    private fun pct(part: BigDecimal, whole: BigDecimal): BigDecimal =
++        if (whole.signum() == 0) BigDecimal.ZERO
++        else part.multiply(BigDecimal(100)).divide(whole, 2, RoundingMode.HALF_UP)
++}
+diff --git a/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CreditReminder.kt b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CreditReminder.kt
+new file mode 100644
+index 0000000..193382b
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CreditReminder.kt
+@@ -0,0 +1,46 @@
++package com.pennywiseai.tracker.domain.rotation
++
++import java.math.BigDecimal
++import java.time.Duration
++import java.time.LocalDateTime
++
++/** One card spend the user should be asked about. */
++data class ReminderItem(
++    val outId: Long,
++    val cardLabel: String,
++    val spent: BigDecimal,
++    val at: LocalDateTime,
++)
++
++/**
++ * Decides which card spends deserve a "was a credit missed?" notification right now.
++ * Pure on purpose (no Android types) so the rules are unit-tested on the JVM.
++ */
++object CreditReminder {
++
++    /**
++     * A spend is due when it is still unresolved (no credit found, or an unconfirmed suggestion), has not been
++     * notified before, has had [settleMinutes] for the real credit SMS to arrive, is not older than [maxAgeDays],
++     * and it is not night time ([quietStartHour]..[quietEndHour]), when everything waits for the morning.
++     */
++    fun due(
++        report: RotationReport,
++        alreadyNotified: Set<Long>,
++        now: LocalDateTime,
++        settleMinutes: Long = 45L,
++        maxAgeDays: Long = 7L,
++        quietStartHour: Int = 22,
++        quietEndHour: Int = 8,
++    ): List<ReminderItem> {
++        if (now.hour >= quietStartHour || now.hour < quietEndHour) return emptyList()
++        val newest = now.minusMinutes(settleMinutes)
++        val oldest = now.minusDays(maxAgeDays)
++        val items = report.needsCredit.map { ReminderItem(it.outId, it.card.label, it.spent, it.at) } +
++            report.suggestions.map { ReminderItem(it.outId, it.card.label, it.spent, it.at) }
++        return items
++            .distinctBy { it.outId }
++            .filter { it.outId !in alreadyNotified }
++            .filter { !it.at.isAfter(newest) && !it.at.isBefore(oldest) }
++            .sortedBy { it.at }
++    }
++}
+diff --git a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt
+index 168ded6..82d14a3 100644
+--- a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt
++++ b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt
+@@ -93,6 +93,9 @@ data class GoalEdit(val goalId: Long = -1L)
+ @Serializable
+ object Loans
+ 
++@Serializable
++object CardRotation
++
+ @Serializable
+ object RecurringTransactions
+ 
+diff --git a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt
+index b44cf59..6ca2872 100644
+--- a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt
++++ b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt
+@@ -447,6 +447,17 @@ fun PennyWiseNavHost(
+             )
+         }
+ 
++        composable<CardRotation>(
++            enterTransition = { fadeIn(tween(300)) + slideInVertically { it / 4 } },
++            exitTransition = { fadeOut(tween(200)) },
++            popEnterTransition = { fadeIn(tween(300)) },
++            popExitTransition = { fadeOut(tween(200)) + slideOutVertically { it / 4 } }
++        ) {
++            com.pennywiseai.tracker.presentation.rotation.CardRotationScreen(
++                onNavigateBack = { navController.safePopBackStack() }
++            )
++        }
++
+         composable<RecurringTransactions>(
+             enterTransition = { fadeIn(tween(300)) + slideInVertically { it / 4 } },
+             exitTransition = { fadeOut(tween(200)) },
+diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationScreen.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationScreen.kt
+new file mode 100644
+index 0000000..d598dc5
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationScreen.kt
+@@ -0,0 +1,324 @@
++package com.pennywiseai.tracker.presentation.rotation
++
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.automirrored.filled.ArrowBack
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Button
++import androidx.compose.material3.Card
++import androidx.compose.material3.CardDefaults
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.HorizontalDivider
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.RadioButton
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.material3.TopAppBar
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.unit.dp
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.pennywiseai.tracker.domain.rotation.CardLedger
++import com.pennywiseai.tracker.domain.rotation.OnwardUse
++import com.pennywiseai.tracker.domain.rotation.RotationPair
++import com.pennywiseai.tracker.domain.rotation.RotationSuggestion
++import com.pennywiseai.tracker.domain.rotation.UnmatchedSpend
++import java.time.LocalDateTime
++import java.math.BigDecimal
++import java.text.NumberFormat
++import java.time.format.DateTimeFormatter
++import java.util.Locale
++
++private val inr: NumberFormat = NumberFormat.getCurrencyInstance(Locale.Builder().setLanguage("en").setRegion("IN").build())
++private val whenFmt: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM, h:mm a")
++private fun money(v: BigDecimal): String = inr.format(v)
++
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++fun CardRotationScreen(
++    onNavigateBack: () -> Unit,
++    viewModel: CardRotationViewModel = hiltViewModel(),
++) {
++    val state by viewModel.uiState.collectAsStateWithLifecycle()
++    val report = state.report
++    var creditTarget by remember { mutableStateOf<CreditTarget?>(null) }
++
++    creditTarget?.let { target ->
++        MissingCreditDialog(
++            target = target,
++            accounts = state.accounts,
++            onDismiss = { creditTarget = null },
++            onSave = { amount, account ->
++                if (viewModel.addMissingCredit(target.outId, target.spent, target.at, amount, account)) creditTarget = null
++            },
++        )
++    }
++
++    Scaffold(
++        topBar = {
++            TopAppBar(
++                title = { Text("Card rotation") },
++                navigationIcon = {
++                    IconButton(onClick = onNavigateBack) {
++                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
++                    }
++                },
++            )
++        },
++    ) { padding ->
++        LazyColumn(
++            modifier = Modifier.padding(padding),
++            contentPadding = PaddingValues(16.dp),
++            verticalArrangement = Arrangement.spacedBy(12.dp),
++        ) {
++            item {
++                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
++                    Column(Modifier.weight(1f)) {
++                        Text("Remind me about card spends with no credit")
++                        Text(
++                            "A notification once a spend has waited 45 minutes with no matching credit.",
++                            style = MaterialTheme.typography.bodySmall,
++                        )
++                    }
++                    Switch(checked = state.remindersEnabled, onCheckedChange = viewModel::setRemindersEnabled)
++                }
++            }
++            if (report != null && report.suggestions.isNotEmpty()) {
++                item {
++                    Text(
++                        "Credit SMS missing? Confirm what these were",
++                        style = MaterialTheme.typography.titleMedium,
++                        fontWeight = FontWeight.SemiBold,
++                    )
++                }
++                items(report.suggestions, key = { it.outId }) { s ->
++                    SuggestionCard(
++                        s,
++                        onEnterCredit = { creditTarget = CreditTarget(s.outId, s.spent, s.at, s.card.label) },
++                        onTransfer = { viewModel.confirmSuggestion(s, OnwardUse.TRANSFER) },
++                        onExpense = { viewModel.confirmSuggestion(s, OnwardUse.EXPENSE) },
++                        onDismiss = { viewModel.dismissSuggestion(s.outId) },
++                    )
++                }
++            }
++            if (report != null && report.needsCredit.isNotEmpty()) {
++                item {
++                    Text(
++                        "Was a credit missed? (${report.needsCredit.size})",
++                        style = MaterialTheme.typography.titleMedium,
++                        fontWeight = FontWeight.SemiBold,
++                    )
++                    Text(
++                        "These card spends have no matching bank credit. If it was a rotation, enter what actually arrived.",
++                        style = MaterialTheme.typography.bodySmall,
++                    )
++                }
++                items(report.needsCredit, key = { "need-${it.outId}" }) { u ->
++                    UnmatchedCard(
++                        u,
++                        onYes = { creditTarget = CreditTarget(u.outId, u.spent, u.at, u.card.label) },
++                        onNo = { viewModel.dismissSuggestion(u.outId) },
++                    )
++                }
++            }
++            if (report == null || report.cards.isEmpty()) {
++                item {
++                    Text(
++                        if (state.isLoading) "Loading…"
++                        else "No card rotations found yet. A rotation is a credit-card spend at a payment gateway " +
++                            "(Cashfree, Razorpay, PayU…) followed by a slightly smaller credit in your bank account.",
++                        style = MaterialTheme.typography.bodyMedium,
++                    )
++                }
++            } else {
++                item {
++                    Card(modifier = Modifier.fillMaxWidth()) {
++                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                            Text("All cards", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++                            Line("Rotated (card spend)", money(report.totalRotated))
++                            Line("Received in bank", money(report.totalReceived))
++                            Line("Charges paid", money(report.totalCharges), emphasize = true)
++                            HorizontalDivider(Modifier.padding(vertical = 4.dp))
++                            Row(verticalAlignment = Alignment.CenterVertically) {
++                                Column(Modifier.weight(1f)) {
++                                    Text("Hide rotation from income & expenses")
++                                    Text(
++                                        "Excludes both legs from totals. Charges stay visible here.",
++                                        style = MaterialTheme.typography.bodySmall,
++                                    )
++                                }
++                                Switch(checked = state.rotationHidden, onCheckedChange = viewModel::setRotationHidden)
++                            }
++                        }
++                    }
++                }
++                items(report.cards, key = { it.card.label }) { ledger -> CardSection(ledger, onUnlink = viewModel::unlink) }
++                if (report.unassignedRepaymentIds.isNotEmpty()) {
++                    item {
++                        Text(
++                            "${report.unassignedRepaymentIds.size} card-bill payment(s) worth ${money(report.unassignedRepaid)} " +
++                                "could not be tied to a card (no matching last 4 digits in the SMS).",
++                            style = MaterialTheme.typography.bodySmall,
++                        )
++                    }
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun CardSection(ledger: CardLedger, onUnlink: (RotationPair) -> Unit) {
++    Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors()) {
++        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
++            Text(ledger.card.label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++            Line("Rotated", money(ledger.rotated))
++            Line("Received in bank", money(ledger.received))
++            Line("Charges", "${money(ledger.charges)} (${ledger.chargePct}%)", emphasize = true)
++            if (ledger.hasEstimates) {
++                Text("Includes estimates where the bank credit SMS was missing.", style = MaterialTheme.typography.bodySmall)
++            }
++            Line("Paid back to this card", money(ledger.repaid))
++            Line("Still to repay (rotation)", money(ledger.stillToRepay), emphasize = true)
++            HorizontalDivider(Modifier.padding(vertical = 4.dp))
++            ledger.rotations.sortedByDescending { it.at }.forEach { p ->
++                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
++                    Column {
++                        Text(p.at.format(whenFmt), style = MaterialTheme.typography.bodySmall)
++                        Text("${money(p.spent)} → ${money(p.received)}", style = MaterialTheme.typography.bodyMedium)
++                    }
++                    Column(horizontalAlignment = Alignment.End) {
++                        Text("−${money(p.charges)}" + if (p.inferred) " (est.)" else "", style = MaterialTheme.typography.bodyMedium)
++                        if (p.inferred) TextButton(onClick = { onUnlink(p) }) { Text("Unlink") }
++                    }
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun Line(label: String, value: String, emphasize: Boolean = false) {
++    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
++        Text(label, style = MaterialTheme.typography.bodyMedium)
++        Text(
++            value,
++            style = MaterialTheme.typography.bodyMedium,
++            fontWeight = if (emphasize) FontWeight.SemiBold else FontWeight.Normal,
++        )
++    }
++}
++
++@Composable
++private fun SuggestionCard(
++    s: RotationSuggestion,
++    onEnterCredit: () -> Unit,
++    onTransfer: () -> Unit,
++    onExpense: () -> Unit,
++    onDismiss: () -> Unit,
++) {
++    Card(modifier = Modifier.fillMaxWidth()) {
++        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
++            Text(s.card.label, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
++            Text("${money(s.spent)} spent on card · ${s.at.format(whenFmt)}", style = MaterialTheme.typography.bodyMedium)
++            Text("${money(s.onward)} left your bank · ${s.onwardAt.format(whenFmt)}", style = MaterialTheme.typography.bodyMedium)
++            Text("Estimated charges ${money(s.estCharges)}", style = MaterialTheme.typography.bodySmall)
++            Text("What was the bank debit?", style = MaterialTheme.typography.bodySmall)
++            if (s.looksLikeCardBill) Text("It looks like a credit-card bill payment.", style = MaterialTheme.typography.bodySmall)
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                Button(onClick = onTransfer) { Text("Card bill / own account") }
++                OutlinedButton(onClick = onExpense) { Text("Real expense") }
++            }
++            Row {
++                TextButton(onClick = onEnterCredit) { Text("Credit was missing instead") }
++                TextButton(onClick = onDismiss) { Text("Not a rotation") }
++            }
++        }
++    }
++}
++
++private data class CreditTarget(val outId: Long, val spent: BigDecimal, val at: LocalDateTime, val cardLabel: String)
++
++@Composable
++private fun UnmatchedCard(u: UnmatchedSpend, onYes: () -> Unit, onNo: () -> Unit) {
++    Card(modifier = Modifier.fillMaxWidth()) {
++        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
++            Text("${money(u.spent)} · ${u.merchant}", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
++            Text("${u.card.label} · ${u.at.format(whenFmt)}", style = MaterialTheme.typography.bodySmall)
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                Button(onClick = onYes) { Text("Yes, add credit") }
++                OutlinedButton(onClick = onNo) { Text("Not a rotation") }
++            }
++        }
++    }
++}
++
++@Composable
++private fun MissingCreditDialog(
++    target: CreditTarget,
++    accounts: List<com.pennywiseai.tracker.data.database.entity.AccountBalanceEntity>,
++    onDismiss: () -> Unit,
++    onSave: (BigDecimal, com.pennywiseai.tracker.data.database.entity.AccountBalanceEntity?) -> Unit,
++) {
++    var amountText by remember { mutableStateOf("") }
++    var account by remember { mutableStateOf<com.pennywiseai.tracker.data.database.entity.AccountBalanceEntity?>(null) }
++    val amount = amountText.replace(",", "").toBigDecimalOrNull()
++    val valid = amount != null && amount.signum() > 0 && amount <= target.spent
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text("Credit that arrived") },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                Text("${money(target.spent)} was spent on ${target.cardLabel}. How much actually reached your account?")
++                OutlinedTextField(
++                    value = amountText,
++                    onValueChange = { amountText = it },
++                    label = { Text("Amount received") },
++                    singleLine = true,
++                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
++                    isError = amountText.isNotEmpty() && !valid,
++                    supportingText = {
++                        if (valid && amount != null) Text("Charges: ${money(target.spent - amount)}")
++                        else if (amountText.isNotEmpty()) Text("Enter more than 0 and at most ${money(target.spent)}")
++                    },
++                )
++                Text("Credited to", style = MaterialTheme.typography.bodySmall)
++                Row(Modifier.fillMaxWidth().clickable { account = null }, verticalAlignment = Alignment.CenterVertically) {
++                    RadioButton(selected = account == null, onClick = { account = null })
++                    Text("Not sure / skip account")
++                }
++                accounts.forEach { a ->
++                    Row(Modifier.fillMaxWidth().clickable { account = a }, verticalAlignment = Alignment.CenterVertically) {
++                        RadioButton(selected = account?.let { it.bankName == a.bankName && it.accountLast4 == a.accountLast4 } == true, onClick = { account = a })
++                        Text("${a.alias ?: a.bankName} ••${a.accountLast4}")
++                    }
++                }
++            }
++        },
++        confirmButton = { Button(enabled = valid, onClick = { amount?.let { onSave(it, account) } }) { Text("Save") } },
++        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
++    )
++}
+diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationStore.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationStore.kt
+new file mode 100644
+index 0000000..5d27380
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationStore.kt
+@@ -0,0 +1,62 @@
++package com.pennywiseai.tracker.presentation.rotation
++
++import android.content.Context
++import com.pennywiseai.tracker.domain.rotation.ManualLink
++import com.pennywiseai.tracker.domain.rotation.OnwardUse
++
++/**
++ * Small SharedPreferences-backed store shared by the Card rotation screen and the reminder worker, so this
++ * feature needs no Room migration. Not part of the app's backup: reinstalling clears it.
++ *
++ * Link format: "outId:onwardId:T|E". Dismissed / notified: sets of card-spend transaction ids.
++ */
++class CardRotationStore(context: Context) {
++    private val prefs = context.applicationContext.getSharedPreferences(NAME, Context.MODE_PRIVATE)
++
++    fun links(): List<ManualLink> =
++        prefs.getStringSet(KEY_LINKS, emptySet()).orEmpty().mapNotNull { raw ->
++            val p = raw.split(":")
++            val out = p.getOrNull(0)?.toLongOrNull() ?: return@mapNotNull null
++            val onward = p.getOrNull(1)?.toLongOrNull() ?: return@mapNotNull null
++            ManualLink(out, onward, if (p.getOrNull(2) == "E") OnwardUse.EXPENSE else OnwardUse.TRANSFER)
++        }
++
++    fun saveLinks(v: List<ManualLink>) {
++        prefs.edit().putStringSet(
++            KEY_LINKS,
++            v.map { "${it.outId}:${it.onwardId}:${if (it.use == OnwardUse.TRANSFER) "T" else "E"}" }.toSet(),
++        ).apply()
++    }
++
++    fun dismissed(): Set<Long> = longs(KEY_DISMISSED)
++
++    fun saveDismissed(v: Set<Long>) {
++        prefs.edit().putStringSet(KEY_DISMISSED, v.map { it.toString() }.toSet()).apply()
++    }
++
++    /** Spends the user was already reminded about, so each one is announced once. */
++    fun notified(): Set<Long> = longs(KEY_NOTIFIED)
++
++    fun addNotified(ids: Collection<Long>) {
++        // Keep the newest few hundred so the set cannot grow forever.
++        val merged = (notified() + ids).toList().takeLast(MAX_NOTIFIED)
++        prefs.edit().putStringSet(KEY_NOTIFIED, merged.map { it.toString() }.toSet()).apply()
++    }
++
++    /** "Remind me about card spends with no credit"; on by default. */
++    var remindersEnabled: Boolean
++        get() = prefs.getBoolean(KEY_REMIND, true)
++        set(value) { prefs.edit().putBoolean(KEY_REMIND, value).apply() }
++
++    private fun longs(key: String): Set<Long> =
++        prefs.getStringSet(key, emptySet()).orEmpty().mapNotNull { it.toLongOrNull() }.toSet()
++
++    private companion object {
++        const val NAME = "card_rotation"
++        const val KEY_LINKS = "links"
++        const val KEY_DISMISSED = "dismissed"
++        const val KEY_NOTIFIED = "notified"
++        const val KEY_REMIND = "reminders"
++        const val MAX_NOTIFIED = 500
++    }
++}
+diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationViewModel.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationViewModel.kt
+new file mode 100644
+index 0000000..6947fe1
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationViewModel.kt
+@@ -0,0 +1,160 @@
++package com.pennywiseai.tracker.presentation.rotation
++
++import android.content.Context
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import com.pennywiseai.tracker.data.database.entity.AccountBalanceEntity
++import com.pennywiseai.tracker.data.database.entity.TransactionEntity
++import com.pennywiseai.tracker.data.database.entity.TransactionType
++import com.pennywiseai.tracker.data.repository.AccountBalanceRepository
++import com.pennywiseai.tracker.data.repository.TransactionRepository
++import com.pennywiseai.tracker.domain.usecase.AddTransactionUseCase
++import com.pennywiseai.tracker.domain.rotation.CardRotation
++import com.pennywiseai.tracker.domain.rotation.ManualLink
++import com.pennywiseai.tracker.domain.rotation.OnwardUse
++import com.pennywiseai.tracker.domain.rotation.RotationKind
++import com.pennywiseai.tracker.domain.rotation.RotationPair
++import com.pennywiseai.tracker.domain.rotation.RotationReport
++import com.pennywiseai.tracker.domain.rotation.RotationSuggestion
++import com.pennywiseai.tracker.domain.rotation.RotationTxn
++import dagger.hilt.android.lifecycle.HiltViewModel
++import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import java.math.BigDecimal
++import java.time.LocalDateTime
++import javax.inject.Inject
++
++data class CardRotationUiState(
++    val report: RotationReport? = null,
++    /** True when every rotation leg is currently excluded from income/expense totals. */
++    val rotationHidden: Boolean = false,
++    val isLoading: Boolean = true,
++    /** Bank accounts the user can say a missing credit landed in (credit cards excluded). */
++    val accounts: List<AccountBalanceEntity> = emptyList(),
++    /** Hourly "was a credit missed?" notifications. */
++    val remindersEnabled: Boolean = true,
++)
++
++@HiltViewModel
++class CardRotationViewModel @Inject constructor(
++    private val transactionRepository: TransactionRepository,
++    private val accountBalanceRepository: AccountBalanceRepository,
++    private val addTransaction: AddTransactionUseCase,
++    @ApplicationContext context: Context,
++) : ViewModel() {
++
++    private val store = CardRotationStore(context)
++
++    // Confirmations live in SharedPreferences (not Room) so this feature needs no DB migration.
++    // Link format "outId:onwardId:T|E"; dismissed = set of card-spend ids. Not part of the app's backup.
++    private val links = MutableStateFlow(store.links())
++    private val dismissed = MutableStateFlow(store.dismissed())
++
++    private val _uiState = MutableStateFlow(CardRotationUiState(remindersEnabled = store.remindersEnabled))
++    val uiState: StateFlow<CardRotationUiState> = _uiState.asStateFlow()
++
++    init {
++        viewModelScope.launch {
++            accountBalanceRepository.getAllLatestBalances().collect { list ->
++                _uiState.update { it.copy(accounts = list.filter { a -> !a.isCreditCard }) }
++            }
++        }
++        viewModelScope.launch {
++            combine(transactionRepository.getAllTransactions(), links, dismissed) { all, l, d -> Triple(all, l, d) }
++                .collect { (all, l, d) ->
++                    val rows = all.filter { !it.isDeleted && it.currency == "INR" }
++                    val report = withContext(Dispatchers.Default) {
++                        CardRotation.analyze(rows.mapNotNull { it.toRotationTxn() }, links = l, dismissedOutIds = d)
++                    }
++                    val paired = report.pairedIds
++                    val hidden = paired.isNotEmpty() &&
++                        rows.filter { it.id in paired }.all { it.excludedFromAnalytics }
++                    _uiState.update { it.copy(report = report, rotationHidden = hidden, isLoading = false) }
++                }
++        }
++    }
++
++    fun setRemindersEnabled(enabled: Boolean) {
++        store.remindersEnabled = enabled
++        _uiState.update { it.copy(remindersEnabled = enabled) }
++    }
++
++    /** Flags every detected rotation row as excluded from income/expense totals. Reversible. */
++    fun setRotationHidden(hide: Boolean) {
++        val paired = _uiState.value.report?.pairedIds ?: return
++        setExcluded(paired, hide)
++    }
++
++    /** The credit SMS was missing: the user says this card spend and that bank debit belong together. */
++    fun confirmSuggestion(s: RotationSuggestion, use: OnwardUse) {
++        saveLinks(links.value.filter { it.outId != s.outId } + ManualLink(s.outId, s.onwardId, use))
++        setExcluded(if (use == OnwardUse.TRANSFER) setOf(s.outId, s.onwardId) else setOf(s.outId), true)
++    }
++
++    fun dismissSuggestion(outId: Long) {
++        saveDismissed(dismissed.value + outId)
++    }
++
++    /** Undo a confirmed link and put its rows back into the totals. */
++    fun unlink(p: RotationPair) {
++        saveLinks(links.value.filter { it.outId != p.outId })
++        setExcluded(setOf(p.outId, p.inId), false)
++    }
++
++    /**
++     * "Yes, a credit was missed": the user enters what actually arrived (e.g. 10,000 against a 10,500 card
++     * spend). It is saved as a real income row on the chosen account, so balances stay right, and both rows
++     * are excluded from income/expense totals. The difference is the rotation charge.
++     * Returns false (and saves nothing) when the amount is not between 0 and the card spend.
++     */
++    fun addMissingCredit(outId: Long, spent: BigDecimal, at: LocalDateTime, credited: BigDecimal, account: AccountBalanceEntity?): Boolean {
++        if (credited.signum() <= 0 || credited > spent) return false
++        viewModelScope.launch {
++            val date = at.plusMinutes(1)
++            addTransaction.execute(
++                amount = credited,
++                merchant = CardRotation.MANUAL_CREDIT_MERCHANT,
++                category = "Others",
++                type = TransactionType.INCOME,
++                date = date,
++                notes = "Credit entered by hand for card spend #$outId",
++                bankName = account?.bankName,
++                accountLast4 = account?.accountLast4,
++            )
++            val created = transactionRepository.getAllTransactions().first().firstOrNull {
++                it.merchantName == CardRotation.MANUAL_CREDIT_MERCHANT && it.amount.compareTo(credited) == 0 && it.dateTime == date
++            }
++            excludeNow(setOfNotNull(outId, created?.id), true)
++        }
++        return true
++    }
++
++    private fun setExcluded(ids: Set<Long>, excluded: Boolean) {
++        viewModelScope.launch { excludeNow(ids, excluded) }
++    }
++
++    private suspend fun excludeNow(ids: Set<Long>, excluded: Boolean) {
++        val now = LocalDateTime.now()
++        transactionRepository.getAllTransactions().first()
++            .filter { it.id in ids && it.excludedFromAnalytics != excluded }
++            .forEach { transactionRepository.updateTransaction(it.copy(excludedFromAnalytics = excluded, updatedAt = now)) }
++    }
++
++    private fun saveLinks(v: List<ManualLink>) {
++        links.value = v
++        store.saveLinks(v)
++    }
++
++    private fun saveDismissed(v: Set<Long>) {
++        dismissed.value = v
++        store.saveDismissed(v)
++    }
++}
+diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/RotationMapping.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/RotationMapping.kt
+new file mode 100644
+index 0000000..d52002f
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/RotationMapping.kt
+@@ -0,0 +1,26 @@
++package com.pennywiseai.tracker.presentation.rotation
++
++import com.pennywiseai.tracker.data.database.entity.TransactionEntity
++import com.pennywiseai.tracker.data.database.entity.TransactionType
++import com.pennywiseai.tracker.domain.rotation.RotationKind
++import com.pennywiseai.tracker.domain.rotation.RotationTxn
++
++/** Maps a stored transaction to the engine's Android-free model; rows that never take part return null. */
++fun TransactionEntity.toRotationTxn(): RotationTxn? {
++    val kind = when (transactionType) {
++        TransactionType.CREDIT -> RotationKind.CARD_PURCHASE
++        TransactionType.INCOME -> RotationKind.INCOMING
++        TransactionType.EXPENSE -> RotationKind.OUTGOING
++        else -> return null
++    }
++    return RotationTxn(
++        id = id,
++        amount = amount,
++        merchant = merchantName,
++        kind = kind,
++        dateTime = dateTime,
++        bankName = bankName,
++        account = accountNumber,
++        text = listOfNotNull(description, smsBody).joinToString(" "),
++    )
++}
+diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt
+index 29f9269..d15d4dc 100644
+--- a/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt
++++ b/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt
+@@ -436,7 +436,9 @@ class TransactionsViewModel @Inject constructor(
+         val all = _uiState.value.transactions
+         val a = all.firstOrNull { it.id == ids[0] } ?: return
+         val b = all.firstOrNull { it.id == ids[1] } ?: return
+-        val hasExpense = listOf(a, b).any { it.transactionType == TransactionType.EXPENSE }
++        val hasExpense = listOf(a, b).any {
++            it.transactionType == TransactionType.EXPENSE || it.transactionType == TransactionType.CREDIT
++        }
+         val hasIncome = listOf(a, b).any { it.transactionType == TransactionType.INCOME }
+         if (!(hasExpense && hasIncome)) {
+             _bulkSnack.value = BulkSnack(UiText.Res(R.string.txn_list_bulk_transfer_need_pair))
+@@ -460,7 +462,7 @@ class TransactionsViewModel @Inject constructor(
+                 return@launch
+             }
+ 
+-            val (expense, income) = if (a.transactionType == TransactionType.EXPENSE) a to b else b to a
++            val (expense, income) = if (a.transactionType != TransactionType.INCOME) a to b else b to a
+             val fromAcct = expense.accountNumber
+             val toAcct = income.accountNumber
+ 
+@@ -1695,7 +1697,10 @@ private data class BudgetParams(
+  */
+ internal fun computeSelfTransferPairs(
+     txns: List<TransactionEntity>,
+-    matchWindowMinutes: Long = 60L
++    matchWindowMinutes: Long = 60L,
++    // Card rotation: a CREDIT purchase (e.g. paying another card's bill) can be
++    // matched by a payment-received row posted much later.
++    creditMatchWindowMinutes: Long = 48L * 60L
+ ): Map<Long, Long> {
+     if (txns.size < 2) return emptyMap()
+     val acctOf: (TransactionEntity) -> String? = { tx ->
+@@ -1715,7 +1720,11 @@ internal fun computeSelfTransferPairs(
+     val pair = HashMap<Long, Long>(txns.size / 8)
+     val claimedIncome = HashSet<Long>()
+     for (expense in txns) {
+-        if (expense.transactionType != TransactionType.EXPENSE) continue
++        if (expense.transactionType != TransactionType.EXPENSE &&
++            expense.transactionType != TransactionType.CREDIT) continue
++        val windowMinutes =
++            if (expense.transactionType == TransactionType.CREDIT) creditMatchWindowMinutes
++            else matchWindowMinutes
+         val candidates = incomesByKey[expense.currency to expense.amount] ?: continue
+         // Closest in time within the window, not on the same known account, not
+         // already claimed by another expense.
+@@ -1729,7 +1738,7 @@ internal fun computeSelfTransferPairs(
+             }
+             .filter {
+                 java.time.Duration.between(expense.dateTime, it.dateTime)
+-                    .toMinutes().let { d -> kotlin.math.abs(d) <= matchWindowMinutes }
++                    .toMinutes().let { d -> kotlin.math.abs(d) <= windowMinutes }
+             }
+             .minByOrNull {
+                 kotlin.math.abs(
+diff --git a/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt b/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt
+index 45e758d..e0b4d49 100644
+--- a/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt
++++ b/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt
+@@ -524,6 +524,11 @@ fun MainScreen(
+                                     com.pennywiseai.tracker.navigation.BudgetGroups()
+                                 ) { launchSingleTop = true }
+                             },
++                            onNavigateToCardRotation = {
++                                rootNavController?.navigate(
++                                    com.pennywiseai.tracker.navigation.CardRotation
++                                ) { launchSingleTop = true }
++                            },
+                             onNavigateToLoans = {
+                                 rootNavController?.navigate(
+                                     com.pennywiseai.tracker.navigation.Loans
+diff --git a/app/src/main/java/com/pennywiseai/tracker/ui/screens/settings/SettingsScreen.kt b/app/src/main/java/com/pennywiseai/tracker/ui/screens/settings/SettingsScreen.kt
+index 24ee495..fb67c55 100644
+--- a/app/src/main/java/com/pennywiseai/tracker/ui/screens/settings/SettingsScreen.kt
++++ b/app/src/main/java/com/pennywiseai/tracker/ui/screens/settings/SettingsScreen.kt
+@@ -106,6 +106,7 @@ fun SettingsScreen(
+     onNavigateToRules: () -> Unit = {},
+     onNavigateToBudgets: () -> Unit = {},
+     onNavigateToLoans: () -> Unit = {},
++    onNavigateToCardRotation: () -> Unit = {},
+     onNavigateToRecurring: () -> Unit = {},
+     onNavigateToTransactionGroups: () -> Unit = {},
+     onNavigateToExchangeRates: () -> Unit = {},
+@@ -618,6 +619,15 @@ fun SettingsScreen(
+                     onClick = onNavigateToLoans,
+                     position = ListItemPosition.Middle
+                 )
++                SettingsNavItem(
++                    icon = Icons.Default.CreditCard,
++                    iconBgColor = amber_light,
++                    iconTint = amber_dark,
++                    title = "Card rotation",
++                    subtitle = "Credit-card to bank rotations, charges and repayments",
++                    onClick = onNavigateToCardRotation,
++                    position = ListItemPosition.Middle
++                )
+                 SettingsNavItem(
+                     icon = Icons.Default.EventRepeat,
+                     iconBgColor = green_light,
+diff --git a/app/src/main/java/com/pennywiseai/tracker/worker/CardCreditCheckWorker.kt b/app/src/main/java/com/pennywiseai/tracker/worker/CardCreditCheckWorker.kt
+new file mode 100644
+index 0000000..6906ed6
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/worker/CardCreditCheckWorker.kt
+@@ -0,0 +1,106 @@
++package com.pennywiseai.tracker.worker
++
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.content.Context
++import android.content.Intent
++import androidx.core.app.NotificationCompat
++import androidx.hilt.work.HiltWorker
++import androidx.work.CoroutineWorker
++import androidx.work.ExistingPeriodicWorkPolicy
++import androidx.work.PeriodicWorkRequestBuilder
++import androidx.work.WorkManager
++import androidx.work.WorkerParameters
++import com.pennywiseai.tracker.MainActivity
++import com.pennywiseai.tracker.R
++import com.pennywiseai.tracker.data.repository.TransactionRepository
++import com.pennywiseai.tracker.domain.rotation.CardRotation
++import com.pennywiseai.tracker.domain.rotation.CreditReminder
++import com.pennywiseai.tracker.presentation.rotation.CardRotationStore
++import com.pennywiseai.tracker.presentation.rotation.toRotationTxn
++import dagger.assisted.Assisted
++import dagger.assisted.AssistedInject
++import kotlinx.coroutines.flow.first
++import java.math.BigDecimal
++import java.text.NumberFormat
++import java.time.LocalDateTime
++import java.util.Locale
++import java.util.concurrent.TimeUnit
++
++/**
++ * Hourly check for credit-card spends that never got a matching bank credit. Once a spend has had time for
++ * its credit SMS to arrive, the user is asked once "was a credit missed?"; tapping opens Card rotation.
++ * It reads the same data as the screen and does not touch the SMS receiver.
++ */
++@HiltWorker
++class CardCreditCheckWorker @AssistedInject constructor(
++    @Assisted appContext: Context,
++    @Assisted workerParams: WorkerParameters,
++    private val transactionRepository: TransactionRepository,
++) : CoroutineWorker(appContext, workerParams) {
++
++    override suspend fun doWork(): Result {
++        val context = applicationContext
++        val store = CardRotationStore(context)
++        if (!store.remindersEnabled) return Result.success()
++
++        val now = LocalDateTime.now()
++        val rows = transactionRepository.getAllTransactions().first().filter { !it.isDeleted && it.currency == "INR" }
++        val report = CardRotation.analyze(
++            rows.mapNotNull { it.toRotationTxn() },
++            links = store.links(),
++            dismissedOutIds = store.dismissed(),
++            asOf = now,
++        )
++        val due = CreditReminder.due(report, store.notified(), now)
++        if (due.isEmpty()) return Result.success()
++
++        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
++        // Nothing to say if the user turned notifications off; try again next run.
++        if (!notificationManager.areNotificationsEnabled()) return Result.success()
++
++        notificationManager.createNotificationChannel(
++            NotificationChannel(CHANNEL_ID, "Card rotation reminders", NotificationManager.IMPORTANCE_DEFAULT).apply {
++                description = "Asks when a credit-card spend has no matching bank credit"
++            },
++        )
++        val inr = NumberFormat.getCurrencyInstance(Locale.Builder().setLanguage("en").setRegion("IN").build())
++        val text = if (due.size == 1) {
++            val d = due.first()
++            "${inr.format(d.spent)} on ${d.cardLabel} has no matching credit. Tap to add it or dismiss."
++        } else {
++            val total = due.fold(BigDecimal.ZERO) { a, d -> a + d.spent }
++            "${due.size} card spends (${inr.format(total)}) have no matching credit. Tap to review."
++        }
++        val open = Intent(context, MainActivity::class.java)
++            .putExtra(MainActivity.EXTRA_OPEN_CARD_ROTATION, true)
++            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
++        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
++            .setSmallIcon(R.drawable.ic_launcher_foreground)
++            .setContentTitle("Was a credit missed?")
++            .setContentText(text)
++            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
++            .setContentIntent(PendingIntent.getActivity(context, NOTIFICATION_ID, open, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
++            .setAutoCancel(true)
++            // Amounts stay off the lock screen, like the other alerts.
++            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
++            .build()
++        notificationManager.notify(NOTIFICATION_ID, notification)
++        store.addNotified(due.map { it.outId })
++        return Result.success()
++    }
++
++    companion object {
++        private const val WORK_NAME = "card_credit_check"
++        private const val CHANNEL_ID = "card_rotation_reminders"
++        // Transaction alerts use the transaction id and the recap uses -2; ids are never below -2 here.
++        private const val NOTIFICATION_ID = -3
++
++        fun enqueuePeriodic(context: Context) {
++            val request = PeriodicWorkRequestBuilder<CardCreditCheckWorker>(1, TimeUnit.HOURS).build()
++            WorkManager.getInstance(context)
++                .enqueueUniquePeriodicWork(WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, request)
++        }
++    }
++}
+diff --git a/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardRotationTest.kt b/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardRotationTest.kt
+new file mode 100644
+index 0000000..578419d
+--- /dev/null
++++ b/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardRotationTest.kt
+@@ -0,0 +1,274 @@
++package com.pennywiseai.tracker.domain.rotation
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.math.BigDecimal
++import java.time.LocalDateTime
++
++class CardRotationTest {
++
++    private val t0 = LocalDateTime.of(2026, 10, 18, 22, 36)
++
++    private fun txn(
++        id: Long, kind: RotationKind, amount: String, merchant: String,
++        min: Long = 0, bank: String? = null, acct: String? = null, text: String = "",
++    ) = RotationTxn(id, BigDecimal(amount), merchant, kind, t0.plusMinutes(min), bank, acct, text)
++
++    private fun card(id: Long, amount: String, merchant: String = "Cas*scapic Innovations", min: Long = 0, acct: String = "4321") =
++        txn(id, RotationKind.CARD_PURCHASE, amount, merchant, min, "HDFC", acct)
++
++    private fun income(id: Long, amount: String, merchant: String = "Cashfree Payments in your Kotak811 a/c", min: Long = 1) =
++        txn(id, RotationKind.INCOMING, amount, merchant, min, "Kotak", "0811")
++
++    /** The exact screenshot: 50,584.10 on the card, 50,000 lands in the bank one minute later. */
++    @Test
++    fun screenshotCase_isPairedAndChargesAreTheDifference() {
++        val r = CardRotation.analyze(listOf(card(1, "50584.10"), income(2, "50000")))
++        assertEquals(1, r.cards.size)
++        val c = r.cards.single()
++        assertEquals(BigDecimal("584.10"), c.charges)
++        assertEquals(BigDecimal("1.17"), c.chargePct)
++        assertEquals(setOf(1L, 2L), r.pairedIds)
++        assertEquals("HDFC ••4321", c.card.label)
++    }
++
++    @Test
++    fun plainCoincidenceWithoutGateway_isNotPaired() {
++        val r = CardRotation.analyze(listOf(card(1, "50000", merchant = "Croma"), income(2, "49900", merchant = "Salary ACME")))
++        assertTrue(r.cards.isEmpty())
++    }
++
++    @Test
++    fun incomeLargerThanSpend_isNotPaired() {
++        val r = CardRotation.analyze(listOf(card(1, "50000"), income(2, "50100")))
++        assertTrue(r.cards.isEmpty())
++    }
++
++    @Test
++    fun hugeDifference_isNotPaired() {
++        val r = CardRotation.analyze(listOf(card(1, "50000"), income(2, "40000")))
++        assertTrue(r.cards.isEmpty())
++    }
++
++    @Test
++    fun sameAccountOnBothLegs_isNotPaired() {
++        val bad = RotationTxn(2, BigDecimal("50000"), "Cashfree Payments", RotationKind.INCOMING, t0.plusMinutes(1), "HDFC", "4321")
++        assertTrue(CardRotation.analyze(listOf(card(1, "50584.10"), bad)).cards.isEmpty())
++    }
++
++    @Test
++    fun matchingIsOneToOne_andPicksClosestInTime() {
++        val r = CardRotation.analyze(
++            listOf(
++                card(1, "10118.00", min = 0), card(2, "10118.00", min = 120),
++                income(3, "10000", min = 121), income(4, "10000", min = 2),
++            ),
++        )
++        val pairs = r.cards.single().rotations
++        assertEquals(2, pairs.size)
++        assertEquals(4L, pairs.first { it.outId == 1L }.inId)
++        assertEquals(3L, pairs.first { it.outId == 2L }.inId)
++    }
++
++    @Test
++    fun repaymentIsAssignedByLast4_andOthersAreUnassigned() {
++        val r = CardRotation.analyze(
++            listOf(
++                card(1, "50584.10"), income(2, "50000"),
++                txn(10, RotationKind.OUTGOING, "20000", "HDFC Credit Card payment", 60 * 24, "Kotak", "0811", "Paid towards Credit Card XX4321"),
++                txn(11, RotationKind.OUTGOING, "5000", "Credit Card bill", 60 * 25, "Kotak", "0811", "Credit Card XX9999"),
++            ),
++        )
++        val c = r.cards.single()
++        assertEquals(BigDecimal("20000"), c.repaid)
++        assertEquals(BigDecimal("30584.10"), c.stillToRepay)
++        assertEquals(listOf(11L), r.unassignedRepaymentIds)
++        assertEquals(BigDecimal("5000"), r.unassignedRepaid)
++    }
++
++    @Test
++    fun repaymentBeforeFirstRotation_isIgnored_andStillToRepayNeverNegative() {
++        val r = CardRotation.analyze(
++            listOf(
++                card(1, "1011.80"), income(2, "1000"),
++                txn(10, RotationKind.OUTGOING, "999", "Credit Card payment", -60 * 24, text = "XX4321"),
++                txn(11, RotationKind.OUTGOING, "5000", "Credit Card payment", 60, text = "XX4321"),
++            ),
++        )
++        val c = r.cards.single()
++        assertEquals(BigDecimal("5000"), c.repaid)
++        assertEquals(BigDecimal.ZERO, c.stillToRepay)
++    }
++
++    @Test
++    fun credInsideCreditOrCreditedDoesNotCountAsGateway() {
++        val r = CardRotation.analyze(listOf(card(1, "5000", merchant = "Shop"), income(2, "4990", merchant = "Amount credited to your account")))
++        assertTrue(r.cards.isEmpty())
++    }
++
++    // ---- credit SMS missing: card spend followed by a bank debit -------------------------------
++
++    private fun debit(id: Long, amount: String, min: Long, text: String = "", merchant: String = "UPI payment") =
++        txn(id, RotationKind.OUTGOING, amount, merchant, min, "Kotak", "0811", text)
++
++    /** Screenshot 2: 22,000 on the card at 1:17 PM, 21,000 leaves the bank at 3:14 PM, no credit SMS. */
++    @Test
++    fun missingCredit_isOnlySuggested_andNothingIsExcludedUntilConfirmed() {
++        val r = CardRotation.analyze(listOf(card(1, "22000", merchant = "UPI-Merchant", min = 0), debit(2, "21000", min = 117)))
++        assertTrue(r.cards.isEmpty())
++        val s = r.suggestions.single()
++        assertEquals(1L, s.outId)
++        assertEquals(2L, s.onwardId)
++        assertEquals(BigDecimal("1000"), s.estCharges)
++        assertTrue(r.pairedIds.isEmpty())
++    }
++
++    @Test
++    fun confirmedAsTransfer_excludesBothLegs_andCountsEstimatedCharges() {
++        val rows = listOf(card(1, "22000", merchant = "UPI-Merchant"), debit(2, "21000", min = 117, text = "Credit Card XX4321"))
++        val r = CardRotation.analyze(rows, links = listOf(ManualLink(1, 2, OnwardUse.TRANSFER)))
++        val c = r.cards.single()
++        assertEquals(setOf(1L, 2L), r.pairedIds)
++        assertEquals(BigDecimal("1000"), c.charges)
++        assertTrue(c.hasEstimates)
++        assertTrue(r.suggestions.isEmpty())
++    }
++
++    @Test
++    fun confirmedAsExpense_excludesOnlyTheCardLeg() {
++        val rows = listOf(card(1, "22000", merchant = "UPI-Merchant"), debit(2, "21000", min = 117, text = "Rent"))
++        val r = CardRotation.analyze(rows, links = listOf(ManualLink(1, 2, OnwardUse.EXPENSE)))
++        assertEquals(setOf(1L), r.pairedIds)
++        assertEquals(BigDecimal("1000"), r.cards.single().charges)
++    }
++
++    @Test
++    fun dismissedSuggestion_doesNotComeBack() {
++        val rows = listOf(card(1, "22000", merchant = "UPI-Merchant"), debit(2, "21000", min = 117))
++        assertTrue(CardRotation.analyze(rows, dismissedOutIds = setOf(1L)).suggestions.isEmpty())
++    }
++
++    @Test
++    fun debitBeforeTheCardSpend_orTooLate_orTooDifferent_isNotSuggested() {
++        val spend = card(1, "22000", merchant = "Shop")
++        assertTrue(CardRotation.analyze(listOf(spend, debit(2, "21000", min = -120))).suggestions.isEmpty())
++        assertTrue(CardRotation.analyze(listOf(spend, debit(2, "21000", min = 60 * 20))).suggestions.isEmpty())
++        assertTrue(CardRotation.analyze(listOf(spend, debit(2, "15000", min = 60))).suggestions.isEmpty())
++        assertTrue(CardRotation.analyze(listOf(spend, debit(2, "23000", min = 60))).suggestions.isEmpty())
++    }
++
++    @Test
++    fun anAutoPairedRotation_isNeverAlsoSuggestedOrLinked() {
++        val rows = listOf(card(1, "50584.10"), income(2, "50000"), debit(3, "50000", min = 30))
++        val r = CardRotation.analyze(rows, links = listOf(ManualLink(1, 3, OnwardUse.TRANSFER)))
++        assertTrue(r.suggestions.isEmpty())
++        assertEquals(setOf(1L, 2L), r.pairedIds)
++        assertTrue(!r.cards.single().hasEstimates)
++    }
++
++    @Test
++    fun oneDebitIsSuggestedForOnlyOneCardSpend() {
++        val rows = listOf(card(1, "22000", merchant = "A"), card(2, "22000", merchant = "B", min = 5), debit(3, "21000", min = 60))
++        assertEquals(1, CardRotation.analyze(rows).suggestions.size)
++    }
++
++    @Test
++    fun suggestionFlagsCardBillPayments() {
++        val rows = listOf(card(1, "22000", merchant = "X"), debit(2, "21000", min = 60, text = "Credit Card payment XX1111"))
++        assertTrue(CardRotation.analyze(rows).suggestions.single().looksLikeCardBill)
++    }
++
++    // ---- "was a credit missed?" for every unmatched card spend ------------------------------
++
++    private val asOf = t0.plusDays(1)
++
++    @Test
++    fun everyUnmatchedCardSpend_isAsked_butNotPairedOrDismissedOnes() {
++        val rows = listOf(
++            card(1, "10500", merchant = "Shop A"),
++            card(2, "50584.10", min = 600), income(3, "50000", min = 601),
++            card(4, "700", merchant = "Shop B", min = 700),
++        )
++        val r = CardRotation.analyze(rows, dismissedOutIds = setOf(4L), asOf = asOf)
++        assertEquals(listOf(1L), r.needsCredit.map { it.outId })
++    }
++
++    @Test
++    fun spendWithASuggestion_isNotAskedTwice() {
++        val rows = listOf(card(1, "22000", merchant = "UPI"), debit(2, "21000", min = 117))
++        val r = CardRotation.analyze(rows, asOf = asOf)
++        assertEquals(1, r.suggestions.size)
++        assertTrue(r.needsCredit.isEmpty())
++    }
++
++    @Test
++    fun oldSpendsAreNotAsked_andTheMinimumAmountIsHonoured() {
++        val rows = listOf(card(1, "900", merchant = "A"), card(2, "9000", merchant = "B", min = 5), card(3, "9500", merchant = "Old", min = -60 * 24 * 90))
++        val r = CardRotation.analyze(rows, askMinAmount = BigDecimal("1000"), asOf = asOf)
++        assertEquals(listOf(2L), r.needsCredit.map { it.outId })
++    }
++
++    /** 10,500 on the card, user says 10,000 actually arrived: a hand-entered credit row pairs and 500 is the charge. */
++    @Test
++    fun manuallyEnteredCredit_pairsEvenWhenTheFeeIsAbove5Percent() {
++        val manual = RotationTxn(9, BigDecimal("10000"), CardRotation.MANUAL_CREDIT_MERCHANT, RotationKind.INCOMING, t0.plusMinutes(1), "Kotak", "0811")
++        val r = CardRotation.analyze(listOf(card(1, "10500", merchant = "Some shop"), manual), asOf = asOf)
++        val c = r.cards.single()
++        assertEquals(BigDecimal("500"), c.charges)
++        assertEquals(setOf(1L, 9L), r.pairedIds)
++        assertTrue(r.needsCredit.isEmpty())
++        val big = manual.copy(amount = BigDecimal("8000"))
++        assertEquals(BigDecimal("2500"), CardRotation.analyze(listOf(card(1, "10500", merchant = "Some shop"), big), asOf = asOf).cards.single().charges)
++    }
++}
++
++class CreditReminderTest {
++    private val base = LocalDateTime.of(2026, 10, 18, 13, 0)
++
++    private fun spend(id: Long, at: LocalDateTime, amount: String = "10500") =
++        RotationTxn(id, BigDecimal(amount), "Shop", RotationKind.CARD_PURCHASE, at, "HDFC", "4321")
++
++    private fun report(vararg t: RotationTxn, now: LocalDateTime) = CardRotation.analyze(t.toList(), asOf = now)
++
++    @Test
++    fun notYetDue_untilTheCreditSmsHadTimeToArrive() {
++        val s = spend(1, base)
++        assertTrue(CreditReminder.due(report(s, now = base.plusMinutes(30)), emptySet(), base.plusMinutes(30)).isEmpty())
++        assertEquals(listOf(1L), CreditReminder.due(report(s, now = base.plusMinutes(46)), emptySet(), base.plusMinutes(46)).map { it.outId })
++    }
++
++    @Test
++    fun neverNotifiedTwice() {
++        val now = base.plusHours(2)
++        assertTrue(CreditReminder.due(report(spend(1, base), now = now), setOf(1L), now).isEmpty())
++    }
++
++    @Test
++    fun waitsForTheMorning_andOldSpendsAreSkipped() {
++        val late = base.withHour(23)
++        assertTrue(CreditReminder.due(report(spend(1, base), now = late), emptySet(), late).isEmpty())
++        val morning = base.plusDays(1).withHour(9)
++        assertEquals(listOf(1L), CreditReminder.due(report(spend(1, base), now = morning), emptySet(), morning).map { it.outId })
++        val old = base.plusDays(10)
++        assertTrue(CreditReminder.due(report(spend(1, base), now = old), emptySet(), old).isEmpty())
++    }
++
++    @Test
++    fun resolvedSpendsAreNotReminded() {
++        val now = base.plusHours(2)
++        val credit = RotationTxn(2, BigDecimal("10000"), CardRotation.MANUAL_CREDIT_MERCHANT, RotationKind.INCOMING, base.plusMinutes(1), "Kotak", "0811")
++        assertTrue(CreditReminder.due(report(spend(1, base), credit, now = now), emptySet(), now).isEmpty())
++        val dismissed = CardRotation.analyze(listOf(spend(1, base)), dismissedOutIds = setOf(1L), asOf = now)
++        assertTrue(CreditReminder.due(dismissed, emptySet(), now).isEmpty())
++    }
++
++    @Test
++    fun unconfirmedSuggestionsAlsoRemind_once() {
++        val now = base.plusHours(3)
++        val debit = RotationTxn(2, BigDecimal("10000"), "UPI", RotationKind.OUTGOING, base.plusMinutes(100), "Kotak", "0811")
++        val r = report(spend(1, base), debit, now = now)
++        assertEquals(1, r.suggestions.size)
++        assertEquals(listOf(1L), CreditReminder.due(r, emptySet(), now).map { it.outId })
++    }
++}
