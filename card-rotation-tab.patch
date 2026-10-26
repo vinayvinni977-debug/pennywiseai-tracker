@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt b/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt
-index d1d3bc9..b4cbb7f 100644
+index d1d3bc90..b4cbb7f0 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt
 @@ -35,6 +35,9 @@ class MainActivity : FragmentActivity() {
@@ -21,7 +21,7 @@ index d1d3bc9..b4cbb7f 100644
                  com.pennywiseai.tracker.navigation.BudgetGroups(createGoal = intent.getBooleanExtra(EXTRA_CREATE_GOAL, false))
              else -> return
 diff --git a/app/src/main/java/com/pennywiseai/tracker/PennyWiseApplication.kt b/app/src/main/java/com/pennywiseai/tracker/PennyWiseApplication.kt
-index ee190e0..c8faf85 100644
+index ee190e0c..c8faf853 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/PennyWiseApplication.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/PennyWiseApplication.kt
 @@ -91,6 +91,8 @@ class PennyWiseApplication : Application(), Configuration.Provider {
@@ -35,7 +35,7 @@ index ee190e0..c8faf85 100644
              com.pennywiseai.tracker.worker.DailySummaryWorker.sync(
 diff --git a/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardDashboard.kt b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardDashboard.kt
 new file mode 100644
-index 0000000..b9c15aa
+index 00000000..b9c15aaf
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardDashboard.kt
 @@ -0,0 +1,157 @@
@@ -198,10 +198,10 @@ index 0000000..b9c15aa
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardRotation.kt b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardRotation.kt
 new file mode 100644
-index 0000000..ffec0c9
+index 00000000..6ae1d749
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardRotation.kt
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,391 @@
 +package com.pennywiseai.tracker.domain.rotation
 +
 +import java.math.BigDecimal
@@ -365,13 +365,14 @@ index 0000000..ffec0c9
 +    fun analyze(
 +        txns: List<RotationTxn>,
 +        gateways: List<Regex> = DEFAULT_GATEWAYS,
-+        windowMinutes: Long = 48L * 60L,
++        // Heuristics, not proof: a candidate window, never a settlement rule. Configurable in the app.
++        windowMinutes: Long = 24L * 60L,
 +        maxChargePct: BigDecimal = BigDecimal("5"),
 +        links: List<ManualLink> = emptyList(),
 +        dismissedOutIds: Set<Long> = emptySet(),
 +        suggestWindowMinutes: Long = 12L * 60L,
-+        onwardWindowMinutes: Long = 48L * 60L,
-+        askMinAmount: BigDecimal = BigDecimal.ZERO,
++        onwardWindowMinutes: Long = 24L * 60L,
++        askMinAmount: BigDecimal = BigDecimal("5000"),
 +        askWithinDays: Long = 60L,
 +        asOf: LocalDateTime = LocalDateTime.now(),
 +    ): RotationReport {
@@ -594,7 +595,7 @@ index 0000000..ffec0c9
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CreditReminder.kt b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CreditReminder.kt
 new file mode 100644
-index 0000000..193382b
+index 00000000..193382b3
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CreditReminder.kt
 @@ -0,0 +1,46 @@
@@ -645,7 +646,7 @@ index 0000000..193382b
 +    }
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt
-index 168ded6..95d75e6 100644
+index 168ded6d..95d75e61 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt
 @@ -93,6 +93,12 @@ data class GoalEdit(val goalId: Long = -1L)
@@ -662,7 +663,7 @@ index 168ded6..95d75e6 100644
  object RecurringTransactions
  
 diff --git a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt
-index b44cf59..d41fbaf 100644
+index b44cf59a..d41fbaf9 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt
 @@ -447,6 +447,29 @@ fun PennyWiseNavHost(
@@ -696,7 +697,7 @@ index b44cf59..d41fbaf 100644
              enterTransition = { fadeIn(tween(300)) + slideInVertically { it / 4 } },
              exitTransition = { fadeOut(tween(200)) },
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/home/HomeScreen.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/home/HomeScreen.kt
-index 8166d9e..07927fc 100644
+index 8166d9ef..07927fc4 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/presentation/home/HomeScreen.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/home/HomeScreen.kt
 @@ -147,6 +147,7 @@ fun HomeScreen(
@@ -724,10 +725,10 @@ index 8166d9e..07927fc 100644
              // it survives reordering. Each branch keeps its own data guard.
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationScreen.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationScreen.kt
 new file mode 100644
-index 0000000..e10703b
+index 00000000..21da1efc
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationScreen.kt
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,363 @@
 +package com.pennywiseai.tracker.presentation.rotation
 +
 +import androidx.compose.foundation.clickable
@@ -854,6 +855,22 @@ index 0000000..e10703b
 +                    },
 +                    label = { Text("Ask about card spends of at least (₹)") },
 +                    supportingText = { Text("0 asks about every spend. Small everyday spends are usually not rotations.") },
++                    singleLine = true,
++                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
++                    modifier = Modifier.fillMaxWidth(),
++                )
++            }
++            item {
++                var hoursText by remember(state.windowHours) { mutableStateOf(state.windowHours.toString()) }
++                OutlinedTextField(
++                    value = hoursText,
++                    onValueChange = { v ->
++                        val digits = v.filter { it.isDigit() }.take(3)
++                        hoursText = digits
++                        digits.toIntOrNull()?.let { if (it in 1..168) viewModel.setWindowHours(it) }
++                    },
++                    label = { Text("Match window (hours)") },
++                    supportingText = { Text("How close a bank credit must be to a card spend to be a candidate. A guess, never proof. Default 24.") },
 +                    singleLine = true,
 +                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
 +                    modifier = Modifier.fillMaxWidth(),
@@ -1077,10 +1094,10 @@ index 0000000..e10703b
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationStore.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationStore.kt
 new file mode 100644
-index 0000000..d1e318f
+index 00000000..5fd42ce3
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationStore.kt
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,92 @@
 +package com.pennywiseai.tracker.presentation.rotation
 +
 +import android.content.Context
@@ -1137,6 +1154,11 @@ index 0000000..d1e318f
 +        get() = prefs.getInt(KEY_ASK_MIN, DEFAULT_ASK_MIN)
 +        set(value) { prefs.edit().putInt(KEY_ASK_MIN, value.coerceAtLeast(0)).apply() }
 +
++    /** Hours either side of a card spend in which a bank credit counts as a candidate. A heuristic, default 24. */
++    var windowHours: Int
++        get() = prefs.getInt(KEY_WINDOW, DEFAULT_WINDOW_HOURS)
++        set(value) { prefs.edit().putInt(KEY_WINDOW, value.coerceIn(1, 168)).apply() }
++
 +    /** Card-bill payments the user tied to a card by hand (CRED / UPI payments carry no card digits). */
 +    fun assignments(): Map<Long, CardKey> =
 +        prefs.getStringSet(KEY_ASSIGN, emptySet()).orEmpty().mapNotNull { raw ->
@@ -1161,17 +1183,19 @@ index 0000000..d1e318f
 +        const val KEY_NOTIFIED = "notified"
 +        const val KEY_REMIND = "reminders"
 +        const val KEY_ASK_MIN = "ask_min"
++        const val KEY_WINDOW = "window_hours"
 +        const val KEY_ASSIGN = "assign"
 +        const val DEFAULT_ASK_MIN = 5000
++        const val DEFAULT_WINDOW_HOURS = 24
 +        const val MAX_NOTIFIED = 500
 +    }
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationViewModel.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationViewModel.kt
 new file mode 100644
-index 0000000..243eb39
+index 00000000..731cc2f5
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationViewModel.kt
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,212 @@
 +package com.pennywiseai.tracker.presentation.rotation
 +
 +import android.content.Context
@@ -1224,6 +1248,8 @@ index 0000000..243eb39
 +    val remindersEnabled: Boolean = true,
 +    /** Smallest card spend we ask about; 0 = every spend. */
 +    val askMinAmount: Int = 5000,
++    /** Hours either side of a card spend in which a bank credit is a candidate match. */
++    val windowHours: Int = 24,
 +)
 +
 +private data class Inputs(
@@ -1231,6 +1257,7 @@ index 0000000..243eb39
 +    val links: List<ManualLink>,
 +    val dismissed: Set<Long>,
 +    val askMin: Int,
++    val windowHours: Int,
 +)
 +
 +@OptIn(FlowPreview::class)
@@ -1249,8 +1276,9 @@ index 0000000..243eb39
 +    private val links = MutableStateFlow(store.links())
 +    private val dismissed = MutableStateFlow(store.dismissed())
 +    private val askMin = MutableStateFlow(store.askMinAmount)
++    private val windowHours = MutableStateFlow(store.windowHours)
 +
-+    private val _uiState = MutableStateFlow(CardRotationUiState(remindersEnabled = store.remindersEnabled, askMinAmount = store.askMinAmount))
++    private val _uiState = MutableStateFlow(CardRotationUiState(remindersEnabled = store.remindersEnabled, askMinAmount = store.askMinAmount, windowHours = store.windowHours))
 +    val uiState: StateFlow<CardRotationUiState> = _uiState.asStateFlow()
 +
 +    /** One-line confirmations ("Saved ₹10,000 credit · charges ₹500") shown as toasts by the screen. */
@@ -1267,12 +1295,13 @@ index 0000000..243eb39
 +            }
 +        }
 +        viewModelScope.launch {
-+            combine(transactionRepository.getAllTransactions(), links, dismissed, askMin) { all, l, d, m -> Inputs(all, l, d, m) }
++            combine(transactionRepository.getAllTransactions(), links, dismissed, askMin, windowHours) { all, l, d, m, w -> Inputs(all, l, d, m, w) }
 +                .debounce(300)
-+                .collect { (all, l, d, m) ->
++                .collect { (all, l, d, m, w) ->
 +                    val rows = all.filter { !it.isDeleted && it.currency == "INR" }
 +                    val report = withContext(Dispatchers.Default) {
-+                        CardRotation.analyze(rows.mapNotNull { it.toRotationTxn() }, links = l, dismissedOutIds = d, askMinAmount = BigDecimal(m))
++                        CardRotation.analyze(rows.mapNotNull { it.toRotationTxn() }, links = l, dismissedOutIds = d, askMinAmount = BigDecimal(m),
++                            windowMinutes = w * 60L, onwardWindowMinutes = w * 60L)
 +                    }
 +                    val paired = report.pairedIds
 +                    val hidden = paired.isNotEmpty() &&
@@ -1286,6 +1315,12 @@ index 0000000..243eb39
 +        store.askMinAmount = amount
 +        askMin.value = store.askMinAmount
 +        _uiState.update { it.copy(askMinAmount = store.askMinAmount) }
++    }
++
++    fun setWindowHours(hours: Int) {
++        store.windowHours = hours
++        windowHours.value = store.windowHours
++        _uiState.update { it.copy(windowHours = store.windowHours) }
 +    }
 +
 +    fun setRemindersEnabled(enabled: Boolean) {
@@ -1375,7 +1410,7 @@ index 0000000..243eb39
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsHomeEntry.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsHomeEntry.kt
 new file mode 100644
-index 0000000..595dcfc
+index 00000000..595dcfcd
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsHomeEntry.kt
 @@ -0,0 +1,37 @@
@@ -1418,7 +1453,7 @@ index 0000000..595dcfc
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsScreen.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsScreen.kt
 new file mode 100644
-index 0000000..32a9ff8
+index 00000000..32a9ff85
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsScreen.kt
 @@ -0,0 +1,217 @@
@@ -1641,7 +1676,7 @@ index 0000000..32a9ff8
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsViewModel.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsViewModel.kt
 new file mode 100644
-index 0000000..ad6a04c
+index 00000000..ad6a04c4
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsViewModel.kt
 @@ -0,0 +1,69 @@
@@ -1716,7 +1751,7 @@ index 0000000..ad6a04c
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/RotationMapping.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/RotationMapping.kt
 new file mode 100644
-index 0000000..d52002f
+index 00000000..d52002f5
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/RotationMapping.kt
 @@ -0,0 +1,26 @@
@@ -1747,7 +1782,7 @@ index 0000000..d52002f
 +    )
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt
-index 29f9269..d15d4dc 100644
+index 29f92693..d15d4dc0 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt
 @@ -436,7 +436,9 @@ class TransactionsViewModel @Inject constructor(
@@ -1805,7 +1840,7 @@ index 29f9269..d15d4dc 100644
              .minByOrNull {
                  kotlin.math.abs(
 diff --git a/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt b/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt
-index 45e758d..fa7b0af 100644
+index 45e758d8..fa7b0af4 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt
 @@ -212,6 +212,11 @@ fun MainScreen(
@@ -1838,7 +1873,7 @@ index 45e758d..fa7b0af 100644
                                  rootNavController?.navigate(
                                      com.pennywiseai.tracker.navigation.Loans
 diff --git a/app/src/main/java/com/pennywiseai/tracker/ui/screens/settings/SettingsScreen.kt b/app/src/main/java/com/pennywiseai/tracker/ui/screens/settings/SettingsScreen.kt
-index 24ee495..050cadf 100644
+index 24ee4959..050cadff 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/ui/screens/settings/SettingsScreen.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/ui/screens/settings/SettingsScreen.kt
 @@ -106,6 +106,8 @@ fun SettingsScreen(
@@ -1877,10 +1912,10 @@ index 24ee495..050cadf 100644
                      iconBgColor = green_light,
 diff --git a/app/src/main/java/com/pennywiseai/tracker/worker/CardCreditCheckWorker.kt b/app/src/main/java/com/pennywiseai/tracker/worker/CardCreditCheckWorker.kt
 new file mode 100644
-index 0000000..e4347e9
+index 00000000..85fdf1dc
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/worker/CardCreditCheckWorker.kt
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,109 @@
 +package com.pennywiseai.tracker.worker
 +
 +import android.app.NotificationChannel
@@ -1935,6 +1970,8 @@ index 0000000..e4347e9
 +            links = store.links(),
 +            dismissedOutIds = store.dismissed(),
 +            askMinAmount = BigDecimal(store.askMinAmount),
++            windowMinutes = store.windowHours * 60L,
++            onwardWindowMinutes = store.windowHours * 60L,
 +            asOf = now,
 +        )
 +        val due = CreditReminder.due(report, store.notified(), now)
@@ -1990,10 +2027,10 @@ index 0000000..e4347e9
 +}
 diff --git a/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardRotationTest.kt b/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardRotationTest.kt
 new file mode 100644
-index 0000000..4496e74
+index 00000000..02696f3e
 --- /dev/null
 +++ b/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardRotationTest.kt
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,500 @@
 +package com.pennywiseai.tracker.domain.rotation
 +
 +import org.junit.Assert.assertEquals
@@ -2417,3 +2454,245 @@ index 0000000..4496e74
 +        assertTrue(CardRotation.analyze(listOf(other, orphan), asOf = t0.plusDays(1)).cards.isEmpty())
 +    }
 +}
++
++/** Cases named in the development spec (section 16, rotation). Synthetic data only. */
++class RotationSpecTest {
++    private val t0 = LocalDateTime.of(2026, 10, 18, 22, 0)
++
++    private fun spend(id: Long, amount: String, merchant: String = "CAS*SOMEPAY", min: Long = 0) =
++        RotationTxn(id, BigDecimal(amount), merchant, RotationKind.CARD_PURCHASE, t0.plusMinutes(min), "CardBank", "1111")
++
++    private fun credit(id: Long, amount: String, min: Long, merchant: String = "Cashfree Payments") =
++        RotationTxn(id, BigDecimal(amount), merchant, RotationKind.INCOMING, t0.plusMinutes(min), "OwnBank", "2222")
++
++    private fun entered(id: Long, amount: String, forSpend: Long, min: Long = 1) =
++        RotationTxn(id, BigDecimal(amount), CardRotation.MANUAL_CREDIT_MERCHANT, RotationKind.INCOMING, t0.plusMinutes(min), "Manual Entry", null, "Credit entered by hand for card spend #$forSpend")
++
++    @Test
++    fun chargeIsConfirmedSpendMinusConfirmedProceeds() {
++        // 30,500 spent, 29,000 confirmed as proceeds: charge 1,500 (above the 5% auto-match cap, so confirmation is what links it)
++        val r = CardRotation.analyze(listOf(spend(1, "30500"), entered(2, "29000", 1)), asOf = t0.plusDays(1))
++        assertEquals(BigDecimal("1500"), r.cards.single().charges)
++        assertEquals(BigDecimal("1500"), r.cards.single().rotations.single().charges)
++    }
++
++    @Test
++    fun defaultWindowIs24Hours() {
++        val inside = CardRotation.analyze(listOf(spend(1, "10000"), credit(2, "9900", 23 * 60)), asOf = t0.plusDays(3))
++        assertEquals(1, inside.cards.size)
++        val outside = CardRotation.analyze(listOf(spend(1, "10000"), credit(2, "9900", 25 * 60)), asOf = t0.plusDays(3))
++        assertTrue(outside.cards.isEmpty())
++    }
++
++    @Test
++    fun windowIsConfigurable() {
++        val rows = listOf(spend(1, "10000"), credit(2, "9900", 30 * 60))
++        assertTrue(CardRotation.analyze(rows, asOf = t0.plusDays(3)).cards.isEmpty())
++        assertEquals(1, CardRotation.analyze(rows, windowMinutes = 36 * 60L, asOf = t0.plusDays(3)).cards.size)
++    }
++
++    @Test
++    fun reviewThresholdDefaultsTo5000AndIsConfigurable() {
++        val rows = listOf(spend(1, "4999", merchant = "Shop A"), spend(2, "5000", merchant = "Shop B", min = 5), spend(3, "12000", merchant = "Shop C", min = 10))
++        assertEquals(listOf(3L, 2L), CardRotation.analyze(rows, asOf = t0.plusDays(1)).needsCredit.map { it.outId })
++        assertEquals(listOf(3L), CardRotation.analyze(rows, askMinAmount = BigDecimal("12000"), asOf = t0.plusDays(1)).needsCredit.map { it.outId })
++        assertEquals(listOf(3L, 2L, 1L), CardRotation.analyze(rows, askMinAmount = BigDecimal.ZERO, asOf = t0.plusDays(1)).needsCredit.map { it.outId })
++    }
++
++    @Test
++    fun aLargePurchaseIsNotRotationOnAmountAlone() {
++        // 40,000 laptop on the card, and a 39,800 salary-like credit within hours: no gateway, so nothing is auto-matched
++        val rows = listOf(spend(1, "40000", merchant = "Croma Electronics"), credit(2, "39800", 120, merchant = "ACME payroll"))
++        val r = CardRotation.analyze(rows, asOf = t0.plusDays(1))
++        assertTrue(r.cards.isEmpty())
++        assertEquals(listOf(1L), r.needsCredit.map { it.outId })
++    }
++
++    @Test
++    fun missingCreditIsNeverFabricated() {
++        val r = CardRotation.analyze(listOf(spend(1, "30500")), asOf = t0.plusDays(2))
++        assertTrue(r.cards.isEmpty())
++        assertTrue(r.pairedIds.isEmpty())
++        assertEquals(listOf(1L), r.needsCredit.map { it.outId })
++    }
++
++    @Test
++    fun oneCreditIsNeverAllocatedToTwoSpends() {
++        val rows = listOf(spend(1, "10000", min = 0), spend(2, "10000", min = 10), credit(3, "9900", 20))
++        val r = CardRotation.analyze(rows, asOf = t0.plusDays(1))
++        assertEquals(1, r.cards.sumOf { it.rotations.size })
++        assertEquals(1, r.needsCredit.size)
++    }
++
++    @Test
++    fun windowExpiryDoesNotSettleAnything() {
++        // two days later the spend is simply still unmatched and still asked about
++        val r = CardRotation.analyze(listOf(spend(1, "30500")), asOf = t0.plusDays(2))
++        assertEquals(listOf(1L), r.needsCredit.map { it.outId })
++    }
++}
+diff --git a/parser-core/src/main/kotlin/com/pennywiseai/parser/core/bank/HSBCBankParser.kt b/parser-core/src/main/kotlin/com/pennywiseai/parser/core/bank/HSBCBankParser.kt
+index d7baf68c..a64ee39b 100644
+--- a/parser-core/src/main/kotlin/com/pennywiseai/parser/core/bank/HSBCBankParser.kt
++++ b/parser-core/src/main/kotlin/com/pennywiseai/parser/core/bank/HSBCBankParser.kt
+@@ -186,6 +186,13 @@ class HSBCBankParser : BankParser() {
+     }
+ 
+     override fun extractAccountLast4(message: String): String? {
++        // HSBC masks the middle of the account number ("106-826***-006"). Digits on both sides of a mask belong
++        // to different parts of the number, so joining them gave fake endings ("6006") and phantom accounts.
++        // Only the digits after the mask are evidence. Three visible digits are returned as a 3-digit short
++        // mask, which the app links to a full 4-digit account only with the user's confirmation. This must run
++        // before the shared extractor, which would join the digits.
++        maskedAccountTail(message)?.let { return it.tail }
++
+         super.extractAccountLast4(message)?.let { return it }
+ 
+         // Pattern 0: "Credit Card ending with ***6" (Egypt format)
+@@ -238,6 +245,22 @@ class HSBCBankParser : BankParser() {
+         return null
+     }
+ 
++    /** Result of reading a masked "A/c" identifier; [tail] is null when too few digits are visible to name an account. */
++    private class MaskedTail(val tail: String?)
++
++    private fun maskedAccountTail(message: String): MaskedTail? {
++        val raw = Regex("""A/c\s+([\d\-*]+)""", RegexOption.IGNORE_CASE).find(message)?.groupValues?.get(1) ?: return null
++        if (!Regex("""\d[\-\s]*\*+[\-\s]*\d""").containsMatchIn(raw)) return null
++        val digits = raw.takeLastWhile { it != '*' }.filter { it.isDigit() }
++        return MaskedTail(
++            when {
++                digits.length >= 4 -> digits.takeLast(4)
++                digits.length == 3 -> digits
++                else -> null
++            }
++        )
++    }
++
+     override fun extractReference(message: String): String? {
+         // Pattern 1: "with UTR CHASH00007392391" (Issue #118 - NEFT/RTGS/IMPS transactions)
+         val utrPattern = Regex(
+diff --git a/parser-core/src/test/kotlin/TestHSBCBankParser.kt b/parser-core/src/test/kotlin/TestHSBCBankParser.kt
+index bc43ddc9..5df147ac 100644
+--- a/parser-core/src/test/kotlin/TestHSBCBankParser.kt
++++ b/parser-core/src/test/kotlin/TestHSBCBankParser.kt
+@@ -29,7 +29,7 @@ class HSBCBankParserTest {
+                     currency = "INR",
+                     type = TransactionType.INCOME,
+                     merchant = "CHAS A/c ***6983 of John Doe",
+-                    accountLast4 = "0006",
++                    accountLast4 = "006", // only the digits after the mask are visible; "0006" mixed in a digit from before it,
+                     balance = BigDecimal("15000.50"),
+                     reference = "CHASH00007392391"
+                 )
+@@ -44,7 +44,7 @@ class HSBCBankParserTest {
+                     currency = "INR",
+                     type = TransactionType.INCOME,
+                     merchant = "AXIS A/c ***1234 of Jane Smith",
+-                    accountLast4 = "6789",
++                    accountLast4 = "789", // the visible tail after the mask; "6789" mixed in a digit from before the mask
+                     balance = BigDecimal("50000.00"),
+                     reference = "NEFT12345678901"
+                 )
+diff --git a/parser-core/src/test/kotlin/com/pennywiseai/parser/core/bank/HSBCBankParserTest.kt b/parser-core/src/test/kotlin/com/pennywiseai/parser/core/bank/HSBCBankParserTest.kt
+index 9d9e641a..ee6b93ee 100644
+--- a/parser-core/src/test/kotlin/com/pennywiseai/parser/core/bank/HSBCBankParserTest.kt
++++ b/parser-core/src/test/kotlin/com/pennywiseai/parser/core/bank/HSBCBankParserTest.kt
+@@ -52,7 +52,7 @@ class HSBCBankParserTest {
+                     currency = "INR",
+                     type = TransactionType.INCOME,
+                     merchant = "CHAS A/c ***6983 of John Doe",
+-                    accountLast4 = "0006"
++                    accountLast4 = "006"
+                 )
+             ),
+             ParserTestCase(
+@@ -64,11 +64,48 @@ class HSBCBankParserTest {
+                     currency = "INR",
+                     type = TransactionType.EXPENSE,
+                     merchant = "AMAZON",
+-                    accountLast4 = "0006",
++                    accountLast4 = "006",
+                     balance = BigDecimal("98765.44")
+                 )
+             ),
+ 
++            // Masked identifiers: only the digits after the mask are evidence (synthetic examples).
++            ParserTestCase(
++                name = "Masked credit-interest SMS gives the 3-digit tail, not a fake last-4",
++                message = "HSBC: Dear Customer, your HSBC A/c 106-826***-006 has been credited with INR 11.92+ on 01OCT as CREDIT INTEREST. Your available Bal is 699.92.",
++                sender = "VM-HSBCIN-S",
++                expected = ExpectedTransaction(
++                    amount = BigDecimal("11.92"),
++                    currency = "INR",
++                    type = TransactionType.INCOME,
++                    accountLast4 = "006"
++                )
++            ),
++            ParserTestCase(
++                name = "A longer visible prefix does not leak into the ending",
++                message = "HSBC: INR 250.00 is paid from your A/c 106-8265**-066 to SWIGGY on 20-Dec-25. Your Avl Bal is INR 1,000.00 .",
++                sender = "HSBCIN",
++                expected = ExpectedTransaction(
++                    amount = BigDecimal("250.00"),
++                    currency = "INR",
++                    type = TransactionType.EXPENSE,
++                    merchant = "SWIGGY",
++                    accountLast4 = "066"
++                )
++            ),
++            ParserTestCase(
++                name = "Explicit account ending 5006 keeps its full last-4",
++                message = "INR 500.00 is paid from HSBC account XXXXXX5006 to ADEPU VINAY on 14-Oct-26 with ref 723848594303.",
++                sender = "VM-HSBCIN-S",
++                expected = ExpectedTransaction(
++                    amount = BigDecimal("500.00"),
++                    currency = "INR",
++                    type = TransactionType.EXPENSE,
++                    merchant = "ADEPU VINAY",
++                    accountLast4 = "5006"
++                )
++            ),
++
+             // HSBC Egypt — EGP credit card
+             ParserTestCase(
+                 name = "Egypt Credit Card Purchase (EGP)",
+diff --git a/parser-core/src/test/resources/ios-parity.tsv b/parser-core/src/test/resources/ios-parity.tsv
+index b731be01..8455e88d 100644
+--- a/parser-core/src/test/resources/ios-parity.tsv
++++ b/parser-core/src/test/resources/ios-parity.tsv
+@@ -271,8 +271,8 @@ VM-HDFCBK-S	Refund initiated: Amt: Rs.34274.66 on HDFC Bank Credit Card 1111. To
+ VM-HDFCBK-S	Transaction Reversed!On HDFC Bank CREDIT Card xx5555 Amt: Rs.862.16 By AMAZON                000 On 2026-08-21:05:20:26	INCOME|862.16|AMAZON|5555|null|HDFC Bank|INR|null|true|410c1326ee56bf2487d5f061864a4eb0
+ VM-HDFCBK-S	Payment Successful! Rs. 12345.67 from A/c ****4321 to ACMEPAYMENTS via HDFC Bank NetBanking. Not you?Call 18002586161	EXPENSE|12345.67|ACMEPAYMENTS|4321|null|HDFC Bank|INR|null|false|b91cbfd94fc25c57d6776a8ddd9e908b
+ AD-HDFCMF-AC	Your SIP Purchase in Folio 38822412/82 under HDFC Mid Cap Fund-DG for Rs. 7,000.65 has been processed at the NAV of 224.603 for 31.169 units and 24-Feb-2026. Your smart statement https://shrtsms.in/HDFCMF/xYSrbW. Enter your PAN as the password. Sincerely, HDFCMF	INVESTMENT|7000.65|HDFC Mid Cap Fund-DG|null|null|HDFC Mutual Fund|INR|null|false|d64c56b236429f2c87b740764da574ed
+-HSBC	HSBC: A/c 074-260***-006 is credited with INR 5000.00 on 27NOV at 06.33.02 with UTR CHASH00007392391 as NEFT from CHAS A/c ***6983 of John Doe . Your Avl Bal is INR 15000.50.	INCOME|5000.00|CHAS A/c ***6983 of John Doe|0006|15000.50|HSBC Bank|INR|null|false|67c9f610fd64fddc4a9e1c3517ca6f96
+-HSBC	HSBC: A/c 123-456***-789 is credited with INR 2500.75 on 15DEC at 10.15.30 with UTR NEFT12345678901 as NEFT from AXIS A/c ***1234 of Jane Smith . Your Avl Bal is INR 50000.00.	INCOME|2500.75|AXIS A/c ***1234 of Jane Smith|6789|50000.00|HSBC Bank|INR|null|false|1cdf45fd9dfbff8fd149449eaaed2778
++HSBC	HSBC: A/c 074-260***-006 is credited with INR 5000.00 on 27NOV at 06.33.02 with UTR CHASH00007392391 as NEFT from CHAS A/c ***6983 of John Doe . Your Avl Bal is INR 15000.50.	INCOME|5000.00|CHAS A/c ***6983 of John Doe|006|15000.50|HSBC Bank|INR|null|false|67c9f610fd64fddc4a9e1c3517ca6f96
++HSBC	HSBC: A/c 123-456***-789 is credited with INR 2500.75 on 15DEC at 10.15.30 with UTR NEFT12345678901 as NEFT from AXIS A/c ***1234 of Jane Smith . Your Avl Bal is INR 50000.00.	INCOME|2500.75|AXIS A/c ***1234 of Jane Smith|789|50000.00|HSBC Bank|INR|null|false|1cdf45fd9dfbff8fd149449eaaed2778
+ HSBC	Thank you for using HSBC Debit Card XXXXX71xx at IKEA INDIA . for INR 49.00 on 12-04-25.	EXPENSE|49.00|IKEA INDIA|null|null|HSBC Bank|INR|null|true|d720ec02d85422335e377723cb8dfdfc
+ HSBC	Your HSBC creditcard xxxxx1234 used at AMAZON for INR 305.00 on 15-04-25.	CREDIT|305.00|AMAZON|1234|null|HSBC Bank|INR|null|true|abb346204f272057d0329dba6f4314d5
+ HSBC	HSBC: INR 1000.50 is paid from account XXXXXX4567 to ELECTRICITY BOARD on 20APR with ref 222222222222. Your available bal is INR 8000.00.	EXPENSE|1000.50|ELECTRICITY BOARD|4567|8000.00|HSBC Bank|INR|null|false|c8dd21e2226a3f2002e20633c319a2f1
+@@ -655,8 +655,8 @@ GREATERBNK	Your Account XXXX5207 had a DEBIT transaction of RS. 100.00 on 19/04/
+ GREATERBNK	Your a/c no. XXXXXXXX5207 is debited for Rs.100.00 on 19-04-26 and credited to a/c no. XXXXXXXX8364 (UPI Ref no 232135417634) If Not You? Call 18001217224 Greater Bank	EXPENSE|100.00|Bank Transfer|5207|null|Greater Bank|INR|null|false|ad2c10b8adc135ad4b3ba2b4f26fdef5
+ VM-HSBCIN-S	HSBC: Dear HSBC Customer, your NEFT transaction with reference number HSBCN00106726185 for INR 150,000.00 has been credited to the HDFC A/c XXXXXXXXXX6956 of AKASH KEDIA on 01-01-2026 at 15:36:47 .	TRANSFER|150000.00|AKASH KEDIA|6956|null|HSBC Bank|INR|null|false|1324aefb5d2dc41f3b54e446e456d5fd
+ VM-HSBCIN	HSBC: Thank you for using HSBC Debit Card XXXXX71xx for INR 305.00 on 15-Dec-25 at IKEA INDIA .	EXPENSE|305.00|IKEA INDIA|null|null|HSBC Bank|INR|null|true|7300acbfb543bd57c55b7f86996bd6c4
+-VM-HSBCIN-S	HSBC: INR 50,000.00 is credited to your A/c 074-260***-006 as NEFT from CHAS A/c ***6983 of John Doe .	INCOME|50000.00|CHAS A/c ***6983 of John Doe|0006|null|HSBC Bank|INR|null|false|fb0ed35a4d4546b3fb2e524714906600
+-HSBCIN	HSBC: INR 1,234.56 is paid from your A/c 074-260***-006 to AMAZON on 20-Dec-25. Your Avl Bal is INR 98,765.44 .	EXPENSE|1234.56|AMAZON|0006|98765.44|HSBC Bank|INR|null|false|5056cacd1822883503fc5ce661a95521
++VM-HSBCIN-S	HSBC: INR 50,000.00 is credited to your A/c 074-260***-006 as NEFT from CHAS A/c ***6983 of John Doe .	INCOME|50000.00|CHAS A/c ***6983 of John Doe|006|null|HSBC Bank|INR|null|false|fb0ed35a4d4546b3fb2e524714906600
++HSBCIN	HSBC: INR 1,234.56 is paid from your A/c 074-260***-006 to AMAZON on 20-Dec-25. Your Avl Bal is INR 98,765.44 .	EXPENSE|1234.56|AMAZON|006|98765.44|HSBC Bank|INR|null|false|5056cacd1822883503fc5ce661a95521
+ HSBC	Your Credit Card ending with 0006 has been used for EGP 199.99 on 23/01/2026 at SomePremium. Your available limit is EGP 5004.29	CREDIT|199.99|SomePremium|0006|null|HSBC Bank|EGP|null|true|126d3b11dae31f913e05e9f605009e05
+ ARABIISLAMI	100 الف دينار الجائزة الكبرى صارت الك اقرب ، افتح أو غذ حساب التوفير وادخل السحب .	NONE
+ JM-JANABK-S	Dear Customer, Your acct XX005 is credited with INR 8.00 on 13-Jun-26 from NPCI BHIM. UPI Ref no 103475395201 . JANA SFB	INCOME|8.00|NPCI BHIM|005|null|Jana Small Finance Bank|INR|null|false|2aa399b18f43e66bff00ba5a36f915a0
+diff --git a/pennywise-web/server/src/main/resources/bank-samples.json b/pennywise-web/server/src/main/resources/bank-samples.json
+index 3a3e0c21..ce9c628f 100644
+--- a/pennywise-web/server/src/main/resources/bank-samples.json
++++ b/pennywise-web/server/src/main/resources/bank-samples.json
+@@ -546,7 +546,7 @@
+       "amount": "5000.00",
+       "type": "INCOME",
+       "merchant": "CHAS A/c ***6983 of John Doe",
+-      "accountLast4": "0006",
++      "accountLast4": "006",
+       "reference": "CHASH00007392391",
+       "balance": "15000.50"
+     },
