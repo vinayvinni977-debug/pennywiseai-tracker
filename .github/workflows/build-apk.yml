@@ -1,7 +1,12 @@
-name: Build card rotation APK (all Pro features unlocked)
+name: Build card rotation APK
 
 on:
   workflow_dispatch:
+    inputs:
+      separate_install:
+        description: "Install next to the original app (application id ends with .mine). Turn OFF only if you want the original application id."
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -12,13 +17,19 @@ jobs:
 
       - name: Apply the card rotation patch
         run: |
-          PATCH=$(ls -1 card-rotation-tab* | head -n 1)
-          echo "Using $PATCH"
-          git apply --check "$PATCH"
-          git apply "$PATCH"
+          set -euo pipefail
+          if [ ! -f card-rotation-tab.patch ]; then
+            echo "::error::card-rotation-tab.patch is missing from the repository root"
+            exit 1
+          fi
+          git apply --check card-rotation-tab.patch
+          git apply card-rotation-tab.patch
+          git status --short | head -50
 
-      - name: Install next to the original app (id ends with .mine)
+      - name: Application id (separate install)
+        if: ${{ inputs.separate_install }}
         run: |
+          set -euo pipefail
           sed -i '/^        release {/a\            applicationIdSuffix = ".mine"' app/build.gradle.kts
           grep -n 'applicationIdSuffix' app/build.gradle.kts
 
@@ -30,19 +41,33 @@ jobs:
       - name: Signing key
         env:
           KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
-          if [ -n "$KEYSTORE_B64" ]; then
-            echo "Using your saved signing key"
-            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/rotation.jks"
+          set -euo pipefail
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${KEYSTORE_PASSWORD:-}" ]; then
+            echo "Using the signing key saved in repository secrets"
+            echo "$KEYSTORE_B64" | base64 -d > "$KS"
+            STORE_PASS="$KEYSTORE_PASSWORD"
+            KEY_PASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+            ALIAS="${KEY_ALIAS:-rotation}"
           else
-            echo "No saved key, making a temporary one (updates will need an uninstall first)"
-            keytool -genkeypair -keystore "$RUNNER_TEMP/rotation.jks" -alias rotation -keyalg RSA -keysize 2048 -validity 10000 -storepass rotation123 -keypass rotation123 -dname "CN=Card Rotation, O=Personal"
+            echo "::warning::No saved signing key. Using a temporary key for this build only. An installed copy built with a different key cannot be updated in place; it must be uninstalled first, which clears its data."
+            STORE_PASS="$(openssl rand -hex 16)"
+            KEY_PASS="$STORE_PASS"
+            ALIAS="temporary"
+            keytool -genkeypair -keystore "$KS" -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 3650 \
+              -storepass "$STORE_PASS" -keypass "$KEY_PASS" -dname "CN=Temporary build key"
           fi
+          echo "::add-mask::$STORE_PASS"
+          echo "::add-mask::$KEY_PASS"
           {
-            echo "RELEASE_STORE_FILE=$RUNNER_TEMP/rotation.jks"
-            echo "RELEASE_STORE_PASSWORD=rotation123"
-            echo "RELEASE_KEY_ALIAS=rotation"
-            echo "RELEASE_KEY_PASSWORD=rotation123"
+            echo "RELEASE_STORE_FILE=$KS"
+            echo "RELEASE_STORE_PASSWORD=$STORE_PASS"
+            echo "RELEASE_KEY_ALIAS=$ALIAS"
+            echo "RELEASE_KEY_PASSWORD=$KEY_PASS"
           } >> local.properties
 
       - uses: android-actions/setup-android@v3
@@ -51,33 +76,42 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Run the rotation tests (no APK is built if one fails)
+      - name: Test the bank SMS parsers (includes the HSBC account tests)
+        run: ./gradlew :parser-core:jvmTest --build-cache
+
+      - name: Test the card rotation logic
         run: ./gradlew :app:testFdroidDebugUnitTest --tests "com.pennywiseai.tracker.domain.rotation.*" --build-cache
 
-      - name: Keep the test report if tests failed
+      - name: Keep the test reports if a test failed
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-report
-          path: app/build/reports/tests/
+          name: test-reports
+          path: |
+            app/build/reports/tests/
+            parser-core/build/reports/tests/
           retention-days: 7
 
-      # The project's own F-Droid build: every Pro feature is on (unlimited rules, statement imports, CSV
-      # export, account merge, goals). No license check is changed or bypassed.
+      # The project's own F-Droid build: every Pro feature is on. No license or payment check is changed.
       - name: Build release APK (F-Droid variant)
         run: ./gradlew :app:assembleFdroidRelease --build-cache
 
       - name: Make sure the APK is signed
         run: |
+          set -euo pipefail
           DIR=app/build/outputs/apk/fdroid/release
           ls -la "$DIR"
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          KS=$(grep '^RELEASE_STORE_FILE=' local.properties | cut -d= -f2-)
+          SP=$(grep '^RELEASE_STORE_PASSWORD=' local.properties | cut -d= -f2-)
+          KA=$(grep '^RELEASE_KEY_ALIAS=' local.properties | cut -d= -f2-)
+          KP=$(grep '^RELEASE_KEY_PASSWORD=' local.properties | cut -d= -f2-)
           for f in "$DIR"/*.apk; do
             if "$BT/apksigner" verify "$f" >/dev/null 2>&1; then
               echo "Already signed: $f"
             else
               echo "Signing: $f"
-              "$BT/apksigner" sign --ks "$RUNNER_TEMP/rotation.jks" --ks-pass pass:rotation123 --key-pass pass:rotation123 --out "${f%.apk}-signed.apk" "$f"
+              "$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$SP" --ks-key-alias "$KA" --key-pass "pass:$KP" --out "${f%.apk}-signed.apk" "$f"
               rm "$f"
             fi
           done
@@ -87,5 +121,6 @@ jobs:
         with:
           name: card-rotation-apk
           path: app/build/outputs/apk/fdroid/release/*.apk
+          if-no-files-found: error
           retention-days: 14
 
