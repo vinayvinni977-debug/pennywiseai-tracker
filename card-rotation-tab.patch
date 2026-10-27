@@ -1,22 +1,26 @@
 diff --git a/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt b/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt
-index d1d3bc90..b4cbb7f0 100644
+index d1d3bc90..a8b3a46d 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/MainActivity.kt
-@@ -35,6 +35,9 @@ class MainActivity : FragmentActivity() {
+@@ -35,6 +35,12 @@ class MainActivity : FragmentActivity() {
          const val EXTRA_OPEN_BUDGETS = "com.pennywiseai.tracker.OPEN_BUDGETS"
          const val EXTRA_CREATE_GOAL = "com.pennywiseai.tracker.CREATE_GOAL"
  
 +        /** "Was a credit missed?" reminder: open the Card rotation screen. */
 +        const val EXTRA_OPEN_CARD_ROTATION = "com.pennywiseai.tracker.OPEN_CARD_ROTATION"
 +
++        /** Bill-due alert: open the Card payments screen. */
++        const val EXTRA_OPEN_CARD_PAYMENTS = "com.pennywiseai.tracker.OPEN_CARD_PAYMENTS"
++
          /**
           * Deep link that jumps straight to Add Transaction: `pennywise://add`.
           * The single entry point every quick-add surface routes through — the
-@@ -109,6 +112,7 @@ class MainActivity : FragmentActivity() {
+@@ -109,6 +115,8 @@ class MainActivity : FragmentActivity() {
          val goalId = intent.getLongExtra(EXTRA_OPEN_GOAL_ID, -1L)
          widgetDestination = when {
              goalId > 0 -> com.pennywiseai.tracker.navigation.GoalDetail(goalId)
 +            intent.getBooleanExtra(EXTRA_OPEN_CARD_ROTATION, false) -> com.pennywiseai.tracker.navigation.CardRotation
++            intent.getBooleanExtra(EXTRA_OPEN_CARD_PAYMENTS, false) -> com.pennywiseai.tracker.navigation.CardPaymentsRoute
              intent.getBooleanExtra(EXTRA_OPEN_BUDGETS, false) ->
                  com.pennywiseai.tracker.navigation.BudgetGroups(createGoal = intent.getBooleanExtra(EXTRA_CREATE_GOAL, false))
              else -> return
@@ -35,10 +39,10 @@ index ee190e0c..c8faf853 100644
              com.pennywiseai.tracker.worker.DailySummaryWorker.sync(
 diff --git a/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardDashboard.kt b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardDashboard.kt
 new file mode 100644
-index 00000000..b9c15aaf
+index 00000000..a409a30b
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardDashboard.kt
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,122 @@
 +package com.pennywiseai.tracker.domain.rotation
 +
 +import java.math.BigDecimal
@@ -51,6 +55,8 @@ index 00000000..b9c15aaf
 +    val last4: String,
 +    val outstanding: BigDecimal?,
 +    val limit: BigDecimal?,
++    /** When the bank's SMS gave that outstanding figure; it anchors the calculation. */
++    val asOf: LocalDateTime? = null,
 +)
 +
 +enum class ActivityKind { SPEND, PAYMENT, ROTATION_SPEND, ROTATION_CREDIT, ROTATION_ONWARD }
@@ -61,49 +67,45 @@ index 00000000..b9c15aaf
 +    val kind: ActivityKind,
 +    val title: String,
 +    val amount: BigDecimal,
++    /** For payments: confirmed, reversed, failed... so the history shows every outcome. */
++    val status: PaymentStatus? = null,
 +)
 +
 +data class CardSummary(
 +    val card: CardKey,
 +    val spentMonth: BigDecimal,
 +    val spentAll: BigDecimal,
++    /** Confirmed payments only. */
 +    val paidMonth: BigDecimal,
 +    val paidAll: BigDecimal,
-+    /** Outstanding as the bank's SMS last reported it, when the app has it. */
-+    val outstanding: BigDecimal?,
++    /** From one source of truth: the bank's or the user's reconciled figure, plus later spends, minus later confirmed payments. */
++    val outstanding: Outstanding,
 +    val limit: BigDecimal?,
-+    /** spent - paid over the history the app has seen; only an estimate (history may start mid-cycle). */
-+    val estimatedOwed: BigDecimal,
 +    val rotated: BigDecimal,
 +    val rotationCharges: BigDecimal,
++    val partiallyPaid: Boolean,
++    val paidInFull: Boolean,
 +    val activity: List<CardActivity>,
 +) {
++    /** Only shown when the outstanding is anchored to a real figure; an estimate is never presented as exact. */
 +    val usedPercent: Int?
-+        get() = if (outstanding != null && limit != null && limit.signum() > 0)
-+            outstanding.multiply(BigDecimal(100)).divide(limit, 0, java.math.RoundingMode.HALF_UP).toInt()
++        get() = if (!outstanding.isEstimate && limit != null && limit.signum() > 0)
++            outstanding.amount.max(BigDecimal.ZERO).multiply(BigDecimal(100)).divide(limit, 0, java.math.RoundingMode.HALF_UP).toInt()
 +        else null
 +}
 +
-+/** A card-bill payment (often "CRED Club") that the bank SMS did not tie to a card. */
-+data class UnassignedPayment(
-+    val id: Long,
-+    val at: LocalDateTime,
-+    val title: String,
-+    val amount: BigDecimal,
-+)
-+
 +data class DashboardReport(
 +    val cards: List<CardSummary>,
-+    /** Card-bill payments with no card last-4 we could match; the user can assign them by hand. */
-+    val unassigned: List<UnassignedPayment> = emptyList(),
++    /** Bank debits that look like card payments and still wait for the user's confirmation. */
++    val pending: List<PaymentRow> = emptyList(),
++    val questions: Int = 0,
++    val confirmedPaidThisMonth: BigDecimal = BigDecimal.ZERO,
 +) {
-+    val unassignedPaid: BigDecimal get() = unassigned.fold(BigDecimal.ZERO) { a, p -> a + p.amount }
++    val pendingAmount: BigDecimal get() = pending.fold(BigDecimal.ZERO) { a, p -> a + p.txn.amount }
 +    val spentMonth: BigDecimal get() = cards.fold(BigDecimal.ZERO) { a, c -> a + c.spentMonth }
-+    val paidMonth: BigDecimal get() = cards.fold(BigDecimal.ZERO) { a, c -> a + c.paidMonth }
 +    val rotationCharges: BigDecimal get() = cards.fold(BigDecimal.ZERO) { a, c -> a + c.rotationCharges }
-+
-+    /** Bank-reported outstanding where known, otherwise the estimate. */
-+    val outstanding: BigDecimal get() = cards.fold(BigDecimal.ZERO) { a, c -> a + (c.outstanding ?: c.estimatedOwed) }
++    val outstanding: BigDecimal get() = cards.fold(BigDecimal.ZERO) { a, c -> a + c.outstanding.amount.max(BigDecimal.ZERO) }
++    val hasEstimates: Boolean get() = cards.any { it.outstanding.isEstimate }
 +}
 +
 +/** Per-card spend / paid / outstanding / rotation view. Pure (no Android types) so it is unit-tested on the JVM. */
@@ -111,97 +113,536 @@ index 00000000..b9c15aaf
 +
 +    fun build(
 +        txns: List<RotationTxn>,
-+        accounts: List<CardAccount>,
 +        report: RotationReport,
++        payments: PaymentsReport,
 +        asOf: LocalDateTime = LocalDateTime.now(),
 +        activityLimit: Int = 25,
-+        /** Payment id -> the card the user said it paid (for CRED / UPI payments that carry no card digits). */
-+        assignments: Map<Long, CardKey> = emptyMap(),
 +    ): DashboardReport {
-+        class Acc(val key: CardKey) {
-+            var spentMonth = BigDecimal.ZERO
-+            var spentAll = BigDecimal.ZERO
-+            var paidMonth = BigDecimal.ZERO
-+            var paidAll = BigDecimal.ZERO
-+            val activity = ArrayList<CardActivity>()
-+        }
-+
-+        fun norm(bank: String?, last4: String) = "${bank.orEmpty().trim().lowercase()}|$last4"
-+        fun last4(s: String?) = s.orEmpty().filter { it.isDigit() }.takeLast(4)
-+
-+        val accs = LinkedHashMap<String, Acc>()
-+        fun acc(bank: String?, l4: String): Acc {
-+            val display = bank?.takeIf { it.isNotBlank() } ?: "Card"
-+            return accs.getOrPut(norm(display, l4)) { Acc(CardKey(display, l4)) }
-+        }
-+
-+        val rotationOut = report.cards.flatMap { c -> c.rotations.map { it.outId } }.toSet()
 +        val month = YearMonth.from(asOf)
-+
-+        for (t in txns.filter { it.kind == RotationKind.CARD_PURCHASE }) {
-+            val a = acc(t.bankName, last4(t.account))
-+            a.spentAll += t.amount
-+            if (YearMonth.from(t.dateTime) == month) a.spentMonth += t.amount
-+            val kind = if (t.id in rotationOut) ActivityKind.ROTATION_SPEND else ActivityKind.SPEND
-+            a.activity += CardActivity(t.id, t.dateTime, kind, t.merchant, t.amount)
-+        }
-+        // A known card account with no purchases yet still gets a row (its outstanding is useful on its own).
-+        for (c in accounts) acc(c.bank, c.last4)
-+
-+        // Card-bill payments leave a bank account; the card's own "payment received" SMS is skipped by the parsers.
-+        val unassigned = ArrayList<UnassignedPayment>()
-+        val keyed = accs.values.filter { it.key.last4.isNotBlank() }
-+        for (t in txns.filter { it.kind == RotationKind.OUTGOING && CardRotation.CARD_BILL_WORDS.containsMatchIn("${it.merchant} ${it.text}") }) {
-+            val haystack = "${t.merchant} ${t.text}"
-+            val manual = assignments[t.id]?.let { k -> accs[norm(k.bank, k.last4)] }
-+            val hit = keyed.filter { Regex("(?<!\\d)${it.key.last4}(?!\\d)").containsMatchIn(haystack) }
-+            val target = manual ?: hit.singleOrNull()
-+            if (target == null) { unassigned += UnassignedPayment(t.id, t.dateTime, t.merchant, t.amount); continue }
-+            target.paidAll += t.amount
-+            if (YearMonth.from(t.dateTime) == month) target.paidMonth += t.amount
-+            target.activity += CardActivity(t.id, t.dateTime, ActivityKind.PAYMENT, t.merchant, t.amount)
-+        }
-+
-+        // The rotation loop, shown under the card that was rotated.
++        val rotationOut = report.cards.flatMap { c -> c.rotations.map { it.outId } }.toSet()
 +        val byId = txns.associateBy { it.id }
-+        for (ledger in report.cards) {
-+            val a = acc(ledger.card.bank, ledger.card.last4)
-+            for (p in ledger.rotations) {
-+                byId[p.inId]?.let { a.activity += CardActivity(it.id, it.dateTime, ActivityKind.ROTATION_CREDIT, it.merchant, it.amount) }
-+                p.onwardId?.let { id -> byId[id]?.let { a.activity += CardActivity(it.id, it.dateTime, ActivityKind.ROTATION_ONWARD, it.merchant, it.amount) } }
++        val ledgers = report.cards.associateBy { CardPayments.id(it.card) }
++        val purchases = txns.filter { it.kind == RotationKind.CARD_PURCHASE }
++
++        val cards = payments.cards.map { p ->
++            val key = CardPayments.id(p.card)
++            val mine = purchases.filter { t ->
++                CardPayments.id(CardKey(t.bankName?.takeIf { it.isNotBlank() } ?: "Card", t.account.orEmpty().filter { it.isDigit() }.takeLast(4))) == key
 +            }
-+        }
-+
-+        val ledgers = report.cards.associateBy { norm(it.card.bank, it.card.last4) }
-+        val accountByKey = accounts.associateBy { norm(it.bank, it.last4) }
-+
-+        val cards = accs.map { (k, a) ->
-+            val l = ledgers[k]
-+            val acct = accountByKey[k]
++            val activity = ArrayList<CardActivity>()
++            mine.forEach { t ->
++                activity += CardActivity(t.id, t.dateTime, if (t.id in rotationOut) ActivityKind.ROTATION_SPEND else ActivityKind.SPEND, t.merchant, t.amount)
++            }
++            p.payments.forEach { r ->
++                activity += CardActivity(r.txn.id, r.txn.dateTime, ActivityKind.PAYMENT, r.txn.merchant, r.amount ?: r.txn.amount, r.status)
++            }
++            val ledger = ledgers[key]
++            ledger?.rotations?.forEach { rot ->
++                byId[rot.inId]?.let { activity += CardActivity(it.id, it.dateTime, ActivityKind.ROTATION_CREDIT, it.merchant, it.amount) }
++                rot.onwardId?.let { id -> byId[id]?.let { activity += CardActivity(it.id, it.dateTime, ActivityKind.ROTATION_ONWARD, it.merchant, it.amount) } }
++            }
 +            CardSummary(
-+                card = a.key,
-+                spentMonth = a.spentMonth,
-+                spentAll = a.spentAll,
-+                paidMonth = a.paidMonth,
-+                paidAll = a.paidAll,
-+                outstanding = acct?.outstanding,
-+                limit = acct?.limit,
-+                estimatedOwed = (a.spentAll - a.paidAll).max(BigDecimal.ZERO),
-+                rotated = l?.rotated ?: BigDecimal.ZERO,
-+                rotationCharges = l?.charges ?: BigDecimal.ZERO,
-+                activity = a.activity.distinctBy { it.id to it.kind }.sortedByDescending { it.at }.take(activityLimit),
++                card = p.card,
++                spentMonth = mine.filter { YearMonth.from(it.dateTime) == month }.fold(BigDecimal.ZERO) { a, t -> a + t.amount },
++                spentAll = mine.fold(BigDecimal.ZERO) { a, t -> a + t.amount },
++                paidMonth = p.paidMonth,
++                paidAll = p.paidAll,
++                outstanding = p.outstanding,
++                limit = p.limit,
++                rotated = ledger?.rotated ?: BigDecimal.ZERO,
++                rotationCharges = ledger?.charges ?: BigDecimal.ZERO,
++                partiallyPaid = p.partiallyPaid,
++                paidInFull = p.paidInFull,
++                activity = activity.distinctBy { Triple(it.id, it.kind, it.status) }.sortedByDescending { it.at }.take(activityLimit),
 +            )
 +        }.sortedWith(compareByDescending<CardSummary> { it.spentMonth }.thenByDescending { it.spentAll })
 +
-+        return DashboardReport(cards = cards, unassigned = unassigned.sortedByDescending { it.at })
++        return DashboardReport(
++            cards = cards,
++            pending = payments.pending,
++            questions = payments.questions.size,
++            confirmedPaidThisMonth = payments.confirmedThisMonth,
++        )
++    }
++}
+diff --git a/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardPayments.kt b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardPayments.kt
+new file mode 100644
+index 00000000..0853f3db
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardPayments.kt
+@@ -0,0 +1,466 @@
++package com.pennywiseai.tracker.domain.rotation
++
++import java.math.BigDecimal
++import java.time.Duration
++import java.time.LocalDate
++import java.time.LocalDateTime
++import java.time.YearMonth
++
++/**
++ * Credit-card bill payments.
++ *
++ * A bank debit is only a *candidate* payment. It reduces a card's outstanding amount only after the user has
++ * chosen the card and confirmed (CRED and HDFC NetBanking always ask), or when the SMS names the card's own
++ * last four digits. Pending, failed, reversed and duplicate payments never change a balance.
++ *
++ * One source of truth for outstanding: an anchor (the bank's own figure, or a figure the user reconciled) plus
++ * card spends after the anchor, minus confirmed payments after the anchor. Payments are always derived from the
++ * transactions plus the user's decisions; no stored balance is ever adjusted a second time.
++ *
++ * Pure Kotlin (no Android types) so it is unit-tested on the JVM.
++ */
++
++enum class PaymentStatus { PENDING, CONFIRMED, FAILED, REVERSED, DUPLICATE }
++
++enum class PaymentEvidence { CRED, HDFC_NETBANKING, CARD_WORDS, CARD_LAST4, USER_MARKED }
++
++/** One step in a payment's life, kept so history is never lost. */
++data class PaymentEvent(
++    val at: LocalDateTime,
++    val status: PaymentStatus,
++    val card: CardKey?,
++    val amount: BigDecimal?,
++    val note: String,
++)
++
++/** What the user decided about one bank debit. A stored decision always wins over anything derived. */
++data class PaymentDecision(
++    val txnId: Long,
++    val status: PaymentStatus,
++    val card: CardKey?,
++    /** Confirmed amount for the card. May be less than the debit (partial payment of the bill). */
++    val amount: BigDecimal?,
++    /** The user said "this was not a failed/reversed payment", so auto-reversal is switched off for it. */
++    val reversalDismissed: Boolean = false,
++    val history: List<PaymentEvent> = emptyList(),
++)
++
++/** A payment row as the app shows it. [basis] says who decided: the user, SMS evidence, or an automatic rule. */
++data class PaymentRow(
++    val txn: RotationTxn,
++    val status: PaymentStatus,
++    val card: CardKey?,
++    val amount: BigDecimal?,
++    val evidence: PaymentEvidence?,
++    val basis: Basis,
++    val note: String,
++    val history: List<PaymentEvent>,
++    val suggestedCard: CardKey? = null,
++) {
++    enum class Basis { USER, EVIDENCE, AUTO, NONE }
++}
++
++/** The second confirmation step: exactly what will change, shown before anything is saved. */
++data class PaymentPreview(
++    val paymentAmount: BigDecimal,
++    val card: CardKey,
++    val currentOutstanding: BigDecimal,
++    val projectedOutstanding: BigDecimal,
++    val overpays: Boolean,
++    val unallocated: BigDecimal,
++)
++
++enum class AnchorKind { RECONCILED, BANK_SMS, NONE }
++
++data class Outstanding(
++    val amount: BigDecimal,
++    val anchorKind: AnchorKind,
++    val anchorAt: LocalDateTime?,
++    /** True when there is no bank figure to anchor to, so the number is built from recorded history only. */
++    val isEstimate: Boolean,
++    val spendsSince: BigDecimal,
++    val paymentsSince: BigDecimal,
++)
++
++data class Reconciliation(
++    val card: CardKey,
++    val at: LocalDateTime,
++    val bankOutstanding: BigDecimal,
++    val calculatedBefore: BigDecimal,
++    val difference: BigDecimal,
++)
++
++data class CardSchedule(
++    val card: CardKey,
++    /** Day of month the bill is due (1-31); null until the user sets it. Never guessed. */
++    val dueDay: Int? = null,
++    val remindDaysBefore: List<Int> = listOf(3, 1),
++    val remindOnDue: Boolean = true,
++    val overdueAlerts: Boolean = true,
++)
++
++enum class DueAlertKind { BEFORE, ON_DUE, OVERDUE }
++
++data class DueAlert(
++    val card: CardKey,
++    val kind: DueAlertKind,
++    val dueDate: LocalDate,
++    val daysBefore: Int?,
++    /** Stable id so the same event is never announced twice. */
++    val key: String,
++)
++
++/** Something the app cannot settle alone and must ask about. */
++sealed class PaymentQuestion {
++    abstract val txnId: Long
++
++    data class PossibleDuplicate(override val txnId: Long, val otherTxnId: Long) : PaymentQuestion()
++    data class PossibleReversal(override val txnId: Long, val creditTxnId: Long, val creditAt: LocalDateTime) : PaymentQuestion()
++}
++
++data class CardPaymentSummary(
++    val card: CardKey,
++    val outstanding: Outstanding,
++    val limit: BigDecimal?,
++    val paidMonth: BigDecimal,
++    val paidAll: BigDecimal,
++    val payments: List<PaymentRow>,
++    val reconciliations: List<Reconciliation>,
++    val schedule: CardSchedule?,
++    val nextDue: LocalDate?,
++    /** Confirmed payments exist but the bill is not cleared: a partial payment never counts as paid in full. */
++    val partiallyPaid: Boolean,
++    val paidInFull: Boolean,
++)
++
++data class PaymentsReport(
++    val pending: List<PaymentRow>,
++    val cards: List<CardPaymentSummary>,
++    val questions: List<PaymentQuestion>,
++    val allRows: List<PaymentRow>,
++    val confirmedThisMonth: BigDecimal,
++)
++
++object CardPayments {
++
++    private val CRED = Regex("\\bcred\\b", RegexOption.IGNORE_CASE)
++    private val HDFC_CHANNEL = Regex("net\\s*banking|netbanking|\\bnb\\b|bill\\s*pay|billpay|\\bneft\\b|\\bimps\\b", RegexOption.IGNORE_CASE)
++    private val CARD_PAY = Regex("credit\\s*card|\\bcc\\b|card\\s*(payment|bill|dues|no)|cardpay", RegexOption.IGNORE_CASE)
++    private val FAILED_WORDS = Regex("\\b(failed|unsuccessful|declined)\\b", RegexOption.IGNORE_CASE)
++    private val REVERSED_WORDS = Regex("\\b(reversed|reversal|refund(ed)?|returned|cancel(l)?ed)\\b", RegexOption.IGNORE_CASE)
++    private val REFERENCE = Regex("(?<![0-9])[0-9]{10,16}(?![0-9])")
++
++    // ---- detection -------------------------------------------------------------------------------------
++
++    fun isCred(t: RotationTxn): Boolean = CRED.containsMatchIn("${t.merchant} ${t.text}")
++
++    fun isLikelyHdfcCardPayment(t: RotationTxn): Boolean {
++        val s = "${t.merchant} ${t.text}"
++        return t.bankName?.contains("hdfc", ignoreCase = true) == true &&
++            HDFC_CHANNEL.containsMatchIn(s) && CARD_PAY.containsMatchIn(s)
++    }
++
++    private fun cardWords(t: RotationTxn): Boolean = CARD_PAY.containsMatchIn("${t.merchant} ${t.text}")
++
++    /** The one known card whose full last four digits appear in the text, or null (never a partial match). */
++    fun cardByLast4(t: RotationTxn, cards: List<CardKey>): CardKey? {
++        val s = "${t.merchant} ${t.text}"
++        return cards.filter { it.last4.length == 4 && Regex("(?<![0-9])${it.last4}(?![0-9])").containsMatchIn(s) }
++            .distinctBy { id(it) }.singleOrNull()
++    }
++
++    fun evidenceOf(t: RotationTxn, cards: List<CardKey>): PaymentEvidence? = when {
++        t.kind != RotationKind.OUTGOING -> null
++        isCred(t) -> PaymentEvidence.CRED
++        isLikelyHdfcCardPayment(t) -> PaymentEvidence.HDFC_NETBANKING
++        cardWords(t) && cardByLast4(t, cards) != null -> PaymentEvidence.CARD_LAST4
++        cardWords(t) -> PaymentEvidence.CARD_WORDS
++        else -> null
++    }
++
++    fun id(c: CardKey) = "${c.bank.trim().lowercase()}|${c.last4}"
++
++    // ---- confirmation (two steps) -----------------------------------------------------------------------
++
++    /** Step 2 of confirmation: nothing is saved by this call. */
++    fun preview(txn: RotationTxn, card: CardKey, amount: BigDecimal, outstanding: Outstanding): PaymentPreview {
++        require(amount.signum() > 0) { "Payment amount must be above zero" }
++        require(amount <= txn.amount) { "Confirmed amount cannot be more than the bank debit" }
++        val projected = outstanding.amount - amount
++        return PaymentPreview(amount, card, outstanding.amount, projected, projected.signum() < 0, txn.amount - amount)
++    }
++
++    /** Saves the user's confirmation. Fails if the debit is already confirmed so a payment can never count twice. */
++    fun confirm(
++        decisions: Map<Long, PaymentDecision>, txn: RotationTxn, card: CardKey, amount: BigDecimal, now: LocalDateTime,
++    ): Map<Long, PaymentDecision> {
++        require(amount.signum() > 0 && amount <= txn.amount) { "Confirmed amount must be above zero and at most the debit" }
++        val old = decisions[txn.id]
++        check(old?.status != PaymentStatus.CONFIRMED) { "This payment is already confirmed" }
++        return decisions + (txn.id to PaymentDecision(
++            txnId = txn.id, status = PaymentStatus.CONFIRMED, card = card, amount = amount,
++            reversalDismissed = old?.reversalDismissed ?: false,
++            history = (old?.history ?: emptyList()) + PaymentEvent(now, PaymentStatus.CONFIRMED, card, amount, "Confirmed by user"),
++        ))
++    }
++
++    fun markStatus(
++        decisions: Map<Long, PaymentDecision>, txnId: Long, status: PaymentStatus, now: LocalDateTime, note: String,
++    ): Map<Long, PaymentDecision> {
++        val old = decisions[txnId]
++        return decisions + (txnId to PaymentDecision(
++            txnId = txnId, status = status,
++            card = old?.card,
++            amount = old?.amount, reversalDismissed = old?.reversalDismissed ?: false,
++            history = (old?.history ?: emptyList()) + PaymentEvent(now, status, old?.card, old?.amount, note),
++        ))
++    }
++
++    /** "That was not a failed payment": keeps it counted and stops automatic reversal for this debit. */
++    fun dismissReversal(decisions: Map<Long, PaymentDecision>, txnId: Long, now: LocalDateTime): Map<Long, PaymentDecision> {
++        val old = decisions[txnId] ?: return decisions
++        return decisions + (txnId to old.copy(reversalDismissed = true,
++            history = old.history + PaymentEvent(now, old.status, old.card, old.amount, "Reversal evidence dismissed by user")))
++    }
++
++    /** The user says this debit was not a card payment (or wants to redo it). History stays. */
++    fun unassign(decisions: Map<Long, PaymentDecision>, txnId: Long, now: LocalDateTime): Map<Long, PaymentDecision> {
++        val old = decisions[txnId] ?: return decisions
++        return decisions + (txnId to PaymentDecision(txnId, PaymentStatus.PENDING, null, null, old.reversalDismissed,
++            old.history + PaymentEvent(now, PaymentStatus.PENDING, null, null, "Unassigned by user")))
++    }
++
++    // ---- outstanding: one source of truth ------------------------------------------------------------------
++
++    fun outstanding(
++        card: CardKey,
++        txns: List<RotationTxn>,
++        rows: List<PaymentRow>,
++        account: CardAccount?,
++        reconciliations: List<Reconciliation>,
++    ): Outstanding {
++        val key = id(card)
++        val recon = reconciliations.filter { id(it.card) == key }.maxByOrNull { it.at }
++        val bank = account?.let { a -> a.outstanding?.let { amt -> a.asOf?.let { amt to it } } }
++        // The newest of the user's reconciliation and the bank's own SMS figure is the anchor.
++        val anchor: Triple<BigDecimal, LocalDateTime, AnchorKind>? = when {
++            recon != null && (bank == null || recon.at >= bank.second) -> Triple(recon.bankOutstanding, recon.at, AnchorKind.RECONCILED)
++            bank != null -> Triple(bank.first, bank.second, AnchorKind.BANK_SMS)
++            else -> null
++        }
++        val after: (LocalDateTime) -> Boolean = { t -> anchor == null || t.isAfter(anchor.second) }
++        val spends = txns.filter { it.kind == RotationKind.CARD_PURCHASE && id(cardKeyOf(it)) == key && after(it.dateTime) }
++            .fold(BigDecimal.ZERO) { a, t -> a + t.amount }
++        val paid = rows.filter { it.status == PaymentStatus.CONFIRMED && it.card?.let(::id) == key && after(it.txn.dateTime) }
++            .fold(BigDecimal.ZERO) { a, r -> a + (r.amount ?: BigDecimal.ZERO) }
++        val base = anchor?.first ?: BigDecimal.ZERO
++        return Outstanding(base + spends - paid, anchor?.third ?: AnchorKind.NONE, anchor?.second, anchor == null, spends, paid)
++    }
++
++    private fun cardKeyOf(t: RotationTxn) =
++        CardKey(t.bankName?.takeIf { it.isNotBlank() } ?: "Card", t.account.orEmpty().filter { it.isDigit() }.takeLast(4))
++
++    fun reconcile(
++        history: List<Reconciliation>, card: CardKey, bankOutstanding: BigDecimal, now: LocalDateTime, calculatedNow: BigDecimal,
++    ): List<Reconciliation> {
++        require(bankOutstanding.signum() >= 0) { "The bank's outstanding amount cannot be negative" }
++        return history + Reconciliation(card, now, bankOutstanding, calculatedNow, bankOutstanding - calculatedNow)
++    }
++
++    // ---- deriving every payment row ---------------------------------------------------------------------------
++
++    fun rows(
++        txns: List<RotationTxn>,
++        cards: List<CardKey>,
++        decisions: Map<Long, PaymentDecision>,
++    ): Pair<List<PaymentRow>, List<PaymentQuestion>> {
++        val debits = txns.filter { it.kind == RotationKind.OUTGOING }.sortedBy { it.dateTime }
++        val candidates = debits.filter { it.id in decisions || evidenceOf(it, cards) != null }
++
++        val base = candidates.map { t ->
++            val ev = evidenceOf(t, cards)
++            val d = decisions[t.id]
++            val suggested = if (isCred(t)) null else cardByLast4(t, cards)
++            when {
++                d != null -> PaymentRow(t, d.status, d.card, d.amount, ev ?: PaymentEvidence.USER_MARKED, PaymentRow.Basis.USER, d.history.lastOrNull()?.note.orEmpty(), d.history, suggested)
++                // Only a full last-four in the SMS settles the card without asking; CRED and NetBanking always ask.
++                ev == PaymentEvidence.CARD_LAST4 && suggested != null ->
++                    PaymentRow(t, PaymentStatus.CONFIRMED, suggested, t.amount, ev, PaymentRow.Basis.EVIDENCE, "Card named in the bank SMS", emptyList(), suggested)
++                else -> PaymentRow(t, PaymentStatus.PENDING, null, null, ev, PaymentRow.Basis.NONE, "Waiting for your confirmation", emptyList(), suggested)
++            }
++        }.toMutableList()
++
++        val questions = ArrayList<PaymentQuestion>()
++
++        // Duplicates. The user's own decision always wins, but one payment must never reduce outstanding twice.
++        val kept = ArrayList<Int>()
++        for (i in base.indices) {
++            val r = base[i]
++            if (r.status == PaymentStatus.DUPLICATE) continue
++            var flagged = false
++            for (j in kept.toList()) {
++                val o = base[j]
++                if (o.status == PaymentStatus.DUPLICATE) continue
++                val kind = duplicateKind(o.txn, r.txn)
++                if (kind == DuplicateKind.NO) continue
++                val auto = "Same payment as another row (matching amount, time and account or reference)"
++                when {
++                    r.basis != PaymentRow.Basis.USER && kind == DuplicateKind.CLEAR -> {
++                        base[i] = r.copy(status = PaymentStatus.DUPLICATE, card = null, amount = null, basis = PaymentRow.Basis.AUTO, note = auto)
++                        flagged = true
++                    }
++                    r.basis == PaymentRow.Basis.USER && o.basis != PaymentRow.Basis.USER && kind == DuplicateKind.CLEAR ->
++                        base[j] = o.copy(status = PaymentStatus.DUPLICATE, card = null, amount = null, basis = PaymentRow.Basis.AUTO, note = auto)
++                    r.status != PaymentStatus.DUPLICATE -> questions += PaymentQuestion.PossibleDuplicate(r.txn.id, o.txn.id)
++                }
++                if (flagged) break
++            }
++            if (!flagged) kept += i
++        }
++
++        // Failed / reversed: clear evidence reverses automatically; uncertain evidence is a question.
++        val credits = txns.filter { it.kind == RotationKind.INCOMING }
++        for (i in base.indices) {
++            val r = base[i]
++            if (r.status != PaymentStatus.CONFIRMED && r.status != PaymentStatus.PENDING) continue
++            if (decisions[r.txn.id]?.reversalDismissed == true) continue
++            val own = "${r.txn.merchant} ${r.txn.text}"
++            if (FAILED_WORDS.containsMatchIn(own)) {
++                base[i] = r.copy(status = PaymentStatus.FAILED, basis = PaymentRow.Basis.AUTO, note = "The bank message says this payment failed")
++                continue
++            }
++            val refs = references(r.txn)
++            var uncertain: RotationTxn? = null
++            var clear: RotationTxn? = null
++            for (c in credits) {
++                if (c.amount.compareTo(r.txn.amount) != 0) continue
++                val gap = Duration.between(r.txn.dateTime, c.dateTime)
++                if (gap.isNegative || gap > Duration.ofDays(7)) continue
++                val ctext = "${c.merchant} ${c.text}"
++                val sameRef = refs.isNotEmpty() && references(c).any { it in refs }
++                if (REVERSED_WORDS.containsMatchIn(ctext) || sameRef) { clear = c; break } else uncertain = uncertain ?: c
++            }
++            when {
++                clear != null -> base[i] = r.copy(status = PaymentStatus.REVERSED, basis = PaymentRow.Basis.AUTO,
++                    note = "A matching credit marked as a reversal or refund was received",
++                    history = r.history + PaymentEvent(clear.dateTime, PaymentStatus.REVERSED, r.card, r.amount, "Reversal evidence in transaction ${clear.id}"))
++                uncertain != null -> questions += PaymentQuestion.PossibleReversal(r.txn.id, uncertain.id, uncertain.dateTime)
++            }
++        }
++        return base.toList() to questions
++    }
++
++    private enum class DuplicateKind { CLEAR, UNCERTAIN, NO }
++
++    private fun references(t: RotationTxn): Set<String> = REFERENCE.findAll("${t.merchant} ${t.text}").map { it.value }.toSet()
++
++    private fun sameAccount(a: RotationTxn, b: RotationTxn): Boolean? {
++        val x = a.account.orEmpty().filter { it.isDigit() }.takeLast(4)
++        val y = b.account.orEmpty().filter { it.isDigit() }.takeLast(4)
++        if (x.isEmpty() || y.isEmpty()) return null
++        return x == y && a.bankName.orEmpty().trim().equals(b.bankName.orEmpty().trim(), ignoreCase = true)
++    }
++
++    private fun duplicateKind(a: RotationTxn, b: RotationTxn): DuplicateKind {
++        if (a.amount.compareTo(b.amount) != 0) return DuplicateKind.NO
++        val gap = Duration.between(a.dateTime, b.dateTime).abs()
++        val sharedRef = references(a).any { it in references(b) }
++        if (sharedRef && gap <= Duration.ofDays(3)) return DuplicateKind.CLEAR
++        val acct = sameAccount(a, b)
++        if (gap <= Duration.ofMinutes(15) && acct != false) return DuplicateKind.CLEAR
++        if (gap <= Duration.ofHours(24)) return DuplicateKind.UNCERTAIN
++        return DuplicateKind.NO
++    }
++
++    // ---- the full report ------------------------------------------------------------------------------------------
++
++    fun report(
++        txns: List<RotationTxn>,
++        accounts: List<CardAccount>,
++        decisions: Map<Long, PaymentDecision>,
++        reconciliations: List<Reconciliation>,
++        schedules: List<CardSchedule>,
++        asOf: LocalDateTime = LocalDateTime.now(),
++    ): PaymentsReport {
++        val spendCards = txns.filter { it.kind == RotationKind.CARD_PURCHASE }.map { cardKeyOf(it) }
++        val cards = (spendCards + accounts.map { CardKey(it.bank, it.last4) } + decisions.values.mapNotNull { it.card }).distinctBy { id(it) }
++        val (rows, questions) = rows(txns, cards, decisions)
++        val month = YearMonth.from(asOf)
++        val today = asOf.toLocalDate()
++        val accountById = accounts.associateBy { norm(it.bank, it.last4) }
++
++        val summaries = cards.map { c ->
++            val key = id(c)
++            val acct = accountById[key]
++            val mine = rows.filter { it.status == PaymentStatus.CONFIRMED && it.card?.let(::id) == key }
++            val out = outstanding(c, txns, rows, acct, reconciliations)
++            val schedule = schedules.firstOrNull { id(it.card) == key }
++            val due = schedule?.dueDay?.let { nextDue(it, today) }
++            val paidAll = mine.fold(BigDecimal.ZERO) { a, r -> a + (r.amount ?: BigDecimal.ZERO) }
++            val paidMonth = mine.filter { YearMonth.from(it.txn.dateTime) == month }.fold(BigDecimal.ZERO) { a, r -> a + (r.amount ?: BigDecimal.ZERO) }
++            CardPaymentSummary(
++                card = c, outstanding = out, limit = acct?.limit, paidMonth = paidMonth, paidAll = paidAll,
++                payments = rows.filter { it.card?.let(::id) == key }.sortedByDescending { it.txn.dateTime },
++                reconciliations = reconciliations.filter { id(it.card) == key }.sortedByDescending { it.at },
++                schedule = schedule, nextDue = due,
++                partiallyPaid = mine.isNotEmpty() && out.amount.signum() > 0,
++                paidInFull = !out.isEstimate && out.amount.signum() <= 0,
++            )
++        }.sortedByDescending { it.outstanding.amount }
++
++        return PaymentsReport(
++            pending = rows.filter { it.status == PaymentStatus.PENDING }.sortedByDescending { it.txn.dateTime },
++            cards = summaries, questions = questions, allRows = rows,
++            confirmedThisMonth = rows.filter { it.status == PaymentStatus.CONFIRMED && YearMonth.from(it.txn.dateTime) == month }
++                .fold(BigDecimal.ZERO) { a, r -> a + (r.amount ?: BigDecimal.ZERO) },
++        )
++    }
++
++    private fun norm(bank: String?, last4: String) = "${bank.orEmpty().trim().lowercase()}|$last4"
++
++    // ---- due dates and reminders ------------------------------------------------------------------------------------
++
++    /** The next date on or after [today] that falls on [dueDay], clamped to short months. */
++    fun nextDue(dueDay: Int, today: LocalDate): LocalDate {
++        val thisMonth = today.withDayOfMonth(minOf(dueDay, today.lengthOfMonth()))
++        if (!thisMonth.isBefore(today)) return thisMonth
++        val next = today.plusMonths(1)
++        return next.withDayOfMonth(minOf(dueDay, next.lengthOfMonth()))
++    }
++
++    private fun previousDue(dueDay: Int, today: LocalDate): LocalDate {
++        val thisMonth = today.withDayOfMonth(minOf(dueDay, today.lengthOfMonth()))
++        if (thisMonth.isBefore(today)) return thisMonth
++        val prev = today.minusMonths(1)
++        return prev.withDayOfMonth(minOf(dueDay, prev.lengthOfMonth()))
++    }
++
++    /**
++     * Alerts that should be raised today. Each has a stable key; pass the keys already sent and nothing repeats.
++     * Nothing is raised for a card whose outstanding is known to be cleared. A partial payment lowers the amount
++     * but does not silence the alerts.
++     */
++    fun dueAlerts(
++        schedules: List<CardSchedule>, outstanding: Map<String, Outstanding>, today: LocalDate, alreadySent: Set<String>,
++    ): List<DueAlert> {
++        val out = ArrayList<DueAlert>()
++        for (s in schedules) {
++            val day = s.dueDay ?: continue
++            val o = outstanding[id(s.card)]
++            val owes = o == null || o.isEstimate || o.amount.signum() > 0
++            if (!owes) continue
++            val due = nextDue(day, today)
++            fun add(kind: DueAlertKind, date: LocalDate, n: Int?) {
++                val key = "${id(s.card)}|$date|${kind.name}${n ?: ""}"
++                if (key !in alreadySent) out += DueAlert(s.card, kind, date, n, key)
++            }
++            for (n in s.remindDaysBefore.filter { it > 0 }.distinct()) if (today == due.minusDays(n.toLong())) add(DueAlertKind.BEFORE, due, n)
++            if (s.remindOnDue && today == due) add(DueAlertKind.ON_DUE, due, null)
++            if (s.overdueAlerts) {
++                val prev = previousDue(day, today)
++                if (prev.isBefore(today) && Duration.between(prev.atStartOfDay(), today.atStartOfDay()).toDays() <= 14) add(DueAlertKind.OVERDUE, prev, null)
++            }
++        }
++        return out
 +    }
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardRotation.kt b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardRotation.kt
 new file mode 100644
-index 00000000..6ae1d749
+index 00000000..51ea7070
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/CardRotation.kt
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,393 @@
 +package com.pennywiseai.tracker.domain.rotation
 +
 +import java.math.BigDecimal
@@ -469,6 +910,8 @@ index 00000000..6ae1d749
 +        val suggestedOnward = HashSet<Long>()
 +        for (out in txns.filter { it.kind == RotationKind.CARD_PURCHASE }.sortedBy { it.dateTime }) {
 +            if (out.id in usedOut || out.id in dismissedOutIds) continue
++            // Same review threshold as the "credit missed?" list: everyday small spends are not worth a question.
++            if (out.amount < askMinAmount) continue
 +            val minDebit = out.amount.multiply(BigDecimal(100)).divide(BigDecimal(100).add(maxChargePct), 4, RoundingMode.CEILING)
 +            val onward = outgoingTl
 +                .between(out.dateTime.minusMinutes(5), out.dateTime.plusMinutes(suggestWindowMinutes))
@@ -645,11 +1088,82 @@ index 00000000..193382b3
 +            .sortedBy { it.at }
 +    }
 +}
+diff --git a/app/src/main/java/com/pennywiseai/tracker/domain/rotation/PaymentCodec.kt b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/PaymentCodec.kt
+new file mode 100644
+index 00000000..e86c1181
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/domain/rotation/PaymentCodec.kt
+@@ -0,0 +1,65 @@
++package com.pennywiseai.tracker.domain.rotation
++
++import java.math.BigDecimal
++import java.net.URLDecoder
++import java.net.URLEncoder
++import java.time.LocalDateTime
++
++/**
++ * Compact text encoding for the user's payment decisions, reconciliations and due-date settings, so they can be
++ * kept in the app's small settings store and carried in a backup. Free text is URL-encoded, so the separators
++ * (| ; ~ ,) can never appear inside a value. Unreadable lines are skipped, never crash the app.
++ */
++object PaymentCodec {
++    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
++    private fun dec(s: String) = URLDecoder.decode(s, "UTF-8")
++    private fun amt(v: BigDecimal?) = v?.toPlainString().orEmpty()
++    private fun bd(s: String) = if (s.isEmpty()) null else BigDecimal(s)
++    private fun cardOf(bank: String, last4: String) = if (bank.isEmpty() && last4.isEmpty()) null else CardKey(dec(bank), dec(last4))
++    private fun bankOf(c: CardKey?) = c?.let { enc(it.bank) }.orEmpty()
++    private fun last4Of(c: CardKey?) = c?.let { enc(it.last4) }.orEmpty()
++
++    // ---- decisions ----------------------------------------------------------------------------------
++
++    fun encode(d: PaymentDecision): String {
++        val events = d.history.joinToString("~") { e ->
++            listOf(e.at.toString(), e.status.name, bankOf(e.card), last4Of(e.card), amt(e.amount), enc(e.note)).joinToString(";")
++        }
++        return listOf(d.txnId, d.status.name, bankOf(d.card), last4Of(d.card), amt(d.amount), if (d.reversalDismissed) 1 else 0, events).joinToString("|")
++    }
++
++    fun decodeDecision(line: String): PaymentDecision? = runCatching {
++        val p = line.split("|")
++        val history = p.getOrElse(6) { "" }.split("~").filter { it.isNotEmpty() }.map { raw ->
++            val f = raw.split(";")
++            PaymentEvent(LocalDateTime.parse(f[0]), PaymentStatus.valueOf(f[1]), cardOf(f[2], f[3]), bd(f[4]), dec(f.getOrElse(5) { "" }))
++        }
++        PaymentDecision(p[0].toLong(), PaymentStatus.valueOf(p[1]), cardOf(p[2], p[3]), bd(p[4]), p[5] == "1", history)
++    }.getOrNull()
++
++    fun decodeDecisions(lines: Collection<String>): Map<Long, PaymentDecision> =
++        lines.mapNotNull { decodeDecision(it) }.associateBy { it.txnId }
++
++    // ---- reconciliations -------------------------------------------------------------------------------
++
++    fun encode(r: Reconciliation): String =
++        listOf(enc(r.card.bank), enc(r.card.last4), r.at.toString(), amt(r.bankOutstanding), amt(r.calculatedBefore), amt(r.difference)).joinToString("|")
++
++    fun decodeReconciliation(line: String): Reconciliation? = runCatching {
++        val p = line.split("|")
++        Reconciliation(CardKey(dec(p[0]), dec(p[1])), LocalDateTime.parse(p[2]), BigDecimal(p[3]), BigDecimal(p[4]), BigDecimal(p[5]))
++    }.getOrNull()
++
++    // ---- schedules ----------------------------------------------------------------------------------------
++
++    fun encode(s: CardSchedule): String =
++        listOf(enc(s.card.bank), enc(s.card.last4), s.dueDay?.toString().orEmpty(), s.remindDaysBefore.joinToString(","), if (s.remindOnDue) 1 else 0, if (s.overdueAlerts) 1 else 0).joinToString("|")
++
++    fun decodeSchedule(line: String): CardSchedule? = runCatching {
++        val p = line.split("|")
++        CardSchedule(
++            CardKey(dec(p[0]), dec(p[1])), p[2].toIntOrNull()?.takeIf { it in 1..31 },
++            p[3].split(",").mapNotNull { it.toIntOrNull() }.filter { it in 1..31 }, p[4] == "1", p[5] == "1",
++        )
++    }.getOrNull()
++}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt
-index 168ded6d..95d75e61 100644
+index e6bf8e20..63bee258 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseDestinations.kt
-@@ -93,6 +93,12 @@ data class GoalEdit(val goalId: Long = -1L)
+@@ -99,6 +99,15 @@ data class GoalEdit(val goalId: Long = -1L)
  @Serializable
  object Loans
  
@@ -659,14 +1173,17 @@ index 168ded6d..95d75e61 100644
 +@Serializable
 +object CreditCards
 +
++@Serializable
++object CardPaymentsRoute
++
  @Serializable
  object RecurringTransactions
  
 diff --git a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt
-index b44cf59a..d41fbaf9 100644
+index 7ed0d98f..310cbeaf 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/navigation/PennyWiseNavHost.kt
-@@ -447,6 +447,29 @@ fun PennyWiseNavHost(
+@@ -450,6 +450,41 @@ fun PennyWiseNavHost(
              )
          }
  
@@ -678,7 +1195,19 @@ index b44cf59a..d41fbaf9 100644
 +        ) {
 +            com.pennywiseai.tracker.presentation.rotation.CreditCardsScreen(
 +                onNavigateBack = { navController.safePopBackStack() },
-+                onOpenRotation = { navController.navigate(CardRotation) { launchSingleTop = true } }
++                onOpenRotation = { navController.navigate(CardRotation) { launchSingleTop = true } },
++                onOpenPayments = { navController.navigate(CardPaymentsRoute) { launchSingleTop = true } }
++            )
++        }
++
++        composable<CardPaymentsRoute>(
++            enterTransition = { fadeIn(tween(300)) + slideInVertically { it / 4 } },
++            exitTransition = { fadeOut(tween(200)) },
++            popEnterTransition = { fadeIn(tween(300)) },
++            popExitTransition = { fadeOut(tween(200)) + slideOutVertically { it / 4 } }
++        ) {
++            com.pennywiseai.tracker.presentation.rotation.CardPaymentsScreen(
++                onNavigateBack = { navController.safePopBackStack() }
 +            )
 +        }
 +
@@ -723,6 +1252,610 @@ index 8166d9ef..07927fc4 100644
              // 2–6. User-orderable sections (#770). Hidden ones are absent from the
              // list entirely; the entrance stagger follows the *displayed* position so
              // it survives reordering. Each branch keeps its own data guard.
+diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardPaymentsScreen.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardPaymentsScreen.kt
+new file mode 100644
+index 00000000..f27067c6
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardPaymentsScreen.kt
+@@ -0,0 +1,426 @@
++package com.pennywiseai.tracker.presentation.rotation
++
++import android.widget.Toast
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.automirrored.filled.ArrowBack
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Button
++import androidx.compose.material3.Card
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.HorizontalDivider
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.RadioButton
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.material3.TopAppBar
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.unit.dp
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.pennywiseai.tracker.domain.rotation.AnchorKind
++import com.pennywiseai.tracker.domain.rotation.CardKey
++import com.pennywiseai.tracker.domain.rotation.CardPaymentSummary
++import com.pennywiseai.tracker.domain.rotation.CardPayments
++import com.pennywiseai.tracker.domain.rotation.CardSchedule
++import com.pennywiseai.tracker.domain.rotation.PaymentEvidence
++import com.pennywiseai.tracker.domain.rotation.PaymentQuestion
++import com.pennywiseai.tracker.domain.rotation.PaymentRow
++import com.pennywiseai.tracker.domain.rotation.PaymentStatus
++import com.pennywiseai.tracker.domain.rotation.PaymentsReport
++import com.pennywiseai.tracker.domain.rotation.RotationTxn
++import java.math.BigDecimal
++import java.text.NumberFormat
++import java.time.LocalDate
++import java.time.format.DateTimeFormatter
++import java.util.Locale
++
++private val inr: NumberFormat = NumberFormat.getCurrencyInstance(Locale.Builder().setLanguage("en").setRegion("IN").build())
++private val whenFmt: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM, h:mm a")
++private val dateFmt: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM yyyy")
++private fun money(v: BigDecimal): String = inr.format(v)
++
++private fun evidenceLabel(e: PaymentEvidence?): String = when (e) {
++    PaymentEvidence.CRED -> "CRED payment. Always asks which card you paid."
++    PaymentEvidence.HDFC_NETBANKING -> "Looks like an HDFC NetBanking card payment."
++    PaymentEvidence.CARD_WORDS -> "Mentions a card payment but not which card."
++    PaymentEvidence.CARD_LAST4 -> "The SMS names the card."
++    PaymentEvidence.USER_MARKED -> "Marked by you."
++    null -> ""
++}
++
++private fun statusLabel(s: PaymentStatus): String = when (s) {
++    PaymentStatus.PENDING -> "Waiting"
++    PaymentStatus.CONFIRMED -> "Confirmed"
++    PaymentStatus.FAILED -> "Failed"
++    PaymentStatus.REVERSED -> "Reversed"
++    PaymentStatus.DUPLICATE -> "Duplicate"
++}
++
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++fun CardPaymentsScreen(
++    onNavigateBack: () -> Unit,
++    viewModel: CardPaymentsViewModel = hiltViewModel(),
++) {
++    val state by viewModel.uiState.collectAsStateWithLifecycle()
++    val report = state.report
++    val context = LocalContext.current
++    LaunchedEffect(Unit) { viewModel.messages.collect { Toast.makeText(context, it, Toast.LENGTH_LONG).show() } }
++
++    var confirming by remember { mutableStateOf<PaymentRow?>(null) }
++    var reconciling by remember { mutableStateOf<CardPaymentSummary?>(null) }
++    var scheduling by remember { mutableStateOf<CardPaymentSummary?>(null) }
++    var pickingMissed by remember { mutableStateOf(false) }
++    var expanded by remember { mutableStateOf(setOf<String>()) }
++
++    confirming?.let { row ->
++        ConfirmPaymentDialog(
++            row = row, report = report,
++            preview = { card, amount -> viewModel.preview(row.txn, card, amount) },
++            onConfirm = { card, amount -> viewModel.confirm(row.txn, card, amount); confirming = null },
++            onDismiss = { confirming = null },
++        )
++    }
++    reconciling?.let { s ->
++        ReconcileDialog(s, onSave = { viewModel.reconcile(s.card, it); reconciling = null }, onDismiss = { reconciling = null })
++    }
++    scheduling?.let { s ->
++        ScheduleDialog(s, onSave = { viewModel.saveSchedule(it); scheduling = null }, onDismiss = { scheduling = null })
++    }
++    if (pickingMissed) {
++        AlertDialog(
++            onDismissRequest = { pickingMissed = false },
++            title = { Text("Which bank debit was a card payment?") },
++            text = {
++                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                    if (state.recentDebits.isEmpty()) item { Text("No recent bank debits found.") }
++                    items(state.recentDebits, key = { "m-${it.id}" }) { t ->
++                        Column(Modifier.fillMaxWidth().clickable {
++                            pickingMissed = false
++                            confirming = PaymentRow(t, PaymentStatus.PENDING, null, null, PaymentEvidence.USER_MARKED, PaymentRow.Basis.NONE, "", emptyList(), null)
++                        }.padding(vertical = 4.dp)) {
++                            Text("${money(t.amount)} · ${t.merchant}", style = MaterialTheme.typography.bodyMedium, maxLines = 1)
++                            Text(t.dateTime.format(whenFmt), style = MaterialTheme.typography.bodySmall)
++                        }
++                        HorizontalDivider()
++                    }
++                }
++            },
++            confirmButton = {},
++            dismissButton = { TextButton(onClick = { pickingMissed = false }) { Text("Cancel") } },
++        )
++    }
++
++    Scaffold(
++        topBar = {
++            TopAppBar(
++                title = { Text("Card payments") },
++                navigationIcon = { IconButton(onClick = onNavigateBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } },
++            )
++        },
++    ) { padding ->
++        LazyColumn(
++            modifier = Modifier.padding(padding),
++            contentPadding = PaddingValues(16.dp),
++            verticalArrangement = Arrangement.spacedBy(12.dp),
++        ) {
++            if (report == null) {
++                item { Text(if (state.isLoading) "Loading…" else "Nothing to show yet.") }
++                return@LazyColumn
++            }
++            item {
++                Card(Modifier.fillMaxWidth()) {
++                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                        Text("Confirmed card payments this month", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++                        Text(money(report.confirmedThisMonth), style = MaterialTheme.typography.headlineSmall)
++                        Text(
++                            "Only confirmed payments reduce a card's outstanding amount. Waiting, failed, reversed and duplicate payments never do.",
++                            style = MaterialTheme.typography.bodySmall,
++                        )
++                        OutlinedButton(onClick = { pickingMissed = true }) { Text("A card payment was missed") }
++                    }
++                }
++            }
++            if (report.pending.isNotEmpty()) {
++                item { Text("Waiting for your answer (${report.pending.size})", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold) }
++                items(report.pending, key = { "p-${it.txn.id}" }) { row ->
++                    Card(Modifier.fillMaxWidth()) {
++                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                            Text("${money(row.txn.amount)} · ${row.txn.merchant}", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold, maxLines = 1)
++                            Text("${row.txn.dateTime.format(whenFmt)} · ${row.txn.bankName.orEmpty()}", style = MaterialTheme.typography.bodySmall)
++                            Text(evidenceLabel(row.evidence), style = MaterialTheme.typography.bodySmall)
++                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                                Button(onClick = { confirming = row }) { Text("Choose card") }
++                                OutlinedButton(onClick = { viewModel.notACardPayment(row.txn.id) }) { Text("Not a card payment") }
++                            }
++                        }
++                    }
++                }
++            }
++            if (report.questions.isNotEmpty()) {
++                item { Text("Please check (${report.questions.size})", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold) }
++                items(report.questions, key = { "q-${questionKey(it)}" }) { q ->
++                    QuestionCard(q, report, onDuplicate = { viewModel.flagDuplicate(q.txnId) }, onKeep = { viewModel.answerQuestion(q) },
++                        onReverse = { viewModel.markStatus(q.txnId, PaymentStatus.REVERSED, "Reversed after your check") })
++                }
++            }
++            item { Text("Cards", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold) }
++            if (report.cards.isEmpty()) item { Text("No cards found yet. They appear once PennyWise reads a card SMS.", style = MaterialTheme.typography.bodyMedium) }
++            items(report.cards, key = { "c-${CardPayments.id(it.card)}" }) { c ->
++                val open = CardPayments.id(c.card) in expanded
++                CardPaymentsBlock(
++                    c = c, open = open,
++                    onToggle = { val k = CardPayments.id(c.card); expanded = if (open) expanded - k else expanded + k },
++                    onReconcile = { reconciling = c }, onSchedule = { scheduling = c },
++                    onUnassign = { viewModel.unassign(it) },
++                )
++            }
++        }
++    }
++}
++
++@Composable
++private fun QuestionCard(q: PaymentQuestion, report: PaymentsReport, onDuplicate: () -> Unit, onKeep: () -> Unit, onReverse: () -> Unit) {
++    val row = report.allRows.firstOrNull { it.txn.id == q.txnId }
++    Card(Modifier.fillMaxWidth()) {
++        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
++            when (q) {
++                is PaymentQuestion.PossibleDuplicate -> {
++                    val other = report.allRows.firstOrNull { it.txn.id == q.otherTxnId }
++                    Text("Are these the same payment?", fontWeight = FontWeight.SemiBold)
++                    Text("${row?.txn?.let { money(it.amount) + " · " + it.dateTime.format(whenFmt) } ?: "?"}", style = MaterialTheme.typography.bodyMedium)
++                    Text("${other?.txn?.let { money(it.amount) + " · " + it.dateTime.format(whenFmt) } ?: "?"}", style = MaterialTheme.typography.bodyMedium)
++                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                        Button(onClick = onDuplicate) { Text("Same, ignore the first") }
++                        OutlinedButton(onClick = onKeep) { Text("Different payments") }
++                    }
++                }
++                is PaymentQuestion.PossibleReversal -> {
++                    Text("Was this payment reversed?", fontWeight = FontWeight.SemiBold)
++                    Text("${row?.txn?.let { money(it.amount) + " paid " + it.dateTime.format(whenFmt) } ?: "?"}", style = MaterialTheme.typography.bodyMedium)
++                    Text("A credit of the same amount arrived on ${q.creditAt.format(whenFmt)}. It does not say it is a reversal.", style = MaterialTheme.typography.bodySmall)
++                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                        Button(onClick = onReverse) { Text("Yes, reversed") }
++                        OutlinedButton(onClick = onKeep) { Text("No, keep it") }
++                    }
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun CardPaymentsBlock(
++    c: CardPaymentSummary, open: Boolean, onToggle: () -> Unit,
++    onReconcile: () -> Unit, onSchedule: () -> Unit, onUnassign: (Long) -> Unit,
++) {
++    val o = c.outstanding
++    Card(Modifier.fillMaxWidth()) {
++        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
++            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
++                Text(c.card.label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++                when {
++                    c.paidInFull -> Text("Paid in full", style = MaterialTheme.typography.bodyMedium)
++                    c.partiallyPaid -> Text("Partly paid", style = MaterialTheme.typography.bodyMedium)
++                }
++            }
++            Line("Outstanding", money(o.amount.max(BigDecimal.ZERO)), emphasize = true)
++            Text(
++                when (o.anchorKind) {
++                    AnchorKind.RECONCILED -> "Your figure from ${o.anchorAt?.format(whenFmt)}, plus later spends, minus later confirmed payments."
++                    AnchorKind.BANK_SMS -> "The bank's figure from ${o.anchorAt?.format(whenFmt)}, plus later spends, minus later confirmed payments."
++                    AnchorKind.NONE -> "Estimate only. No bank figure yet, so this is built from the history PennyWise has. Reconcile to fix it."
++                },
++                style = MaterialTheme.typography.bodySmall,
++            )
++            c.limit?.let { Line("Credit limit", money(it)) }
++            Line("Paid this month", money(c.paidMonth))
++            Line("Paid, all time", money(c.paidAll))
++            Line("Next due", c.nextDue?.format(dateFmt) ?: "Not set")
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedButton(onClick = onReconcile) { Text("Reconcile") }
++                OutlinedButton(onClick = onSchedule) { Text("Due date & reminders") }
++            }
++            TextButton(onClick = onToggle) { Text(if (open) "Hide history" else "Show history") }
++            if (open) {
++                if (c.payments.isEmpty()) Text("No payments recorded for this card yet.", style = MaterialTheme.typography.bodySmall)
++                c.payments.forEach { r ->
++                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
++                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
++                            Text("${statusLabel(r.status)} · ${r.txn.dateTime.format(whenFmt)}", style = MaterialTheme.typography.bodyMedium)
++                            Text(money(r.amount ?: r.txn.amount), style = MaterialTheme.typography.bodyMedium)
++                        }
++                        Text(r.note, style = MaterialTheme.typography.bodySmall)
++                        r.history.forEach { e -> Text("• ${e.at.format(whenFmt)}: ${statusLabel(e.status)}${e.amount?.let { " ${money(it)}" }.orEmpty()}. ${e.note}", style = MaterialTheme.typography.bodySmall) }
++                        if (r.status == PaymentStatus.CONFIRMED && r.basis != PaymentRow.Basis.NONE) {
++                            TextButton(onClick = { onUnassign(r.txn.id) }) { Text("Undo, move back to waiting") }
++                        }
++                    }
++                    HorizontalDivider()
++                }
++                if (c.reconciliations.isNotEmpty()) {
++                    Text("Reconciliations", fontWeight = FontWeight.SemiBold)
++                    c.reconciliations.forEach { r ->
++                        Text("${r.at.format(whenFmt)}: bank said ${money(r.bankOutstanding)}, PennyWise had ${money(r.calculatedBefore)} (difference ${money(r.difference)})", style = MaterialTheme.typography.bodySmall)
++                    }
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun Line(label: String, value: String, emphasize: Boolean = false) {
++    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
++        Text(label, style = MaterialTheme.typography.bodyMedium)
++        Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = if (emphasize) FontWeight.SemiBold else FontWeight.Normal)
++    }
++}
++
++/** Step 1: choose the card (and the amount, for a partial payment). Step 2: see exactly what will change, then confirm. */
++@Composable
++private fun ConfirmPaymentDialog(
++    row: PaymentRow, report: PaymentsReport?,
++    preview: (CardKey, BigDecimal) -> com.pennywiseai.tracker.domain.rotation.PaymentPreview?,
++    onConfirm: (CardKey, BigDecimal) -> Unit, onDismiss: () -> Unit,
++) {
++    val cards = report?.cards?.map { it.card }.orEmpty()
++    // CRED never pre-selects a card; other payments pre-select a card only when its full last four digits are in the SMS.
++    var chosen by remember { mutableStateOf<CardKey?>(if (row.evidence == PaymentEvidence.CRED) null else row.suggestedCard) }
++    var amountText by remember { mutableStateOf(row.txn.amount.toPlainString()) }
++    var step by remember { mutableStateOf(1) }
++    val amount = amountText.replace(",", "").toBigDecimalOrNull()
++    val pv = if (chosen != null && amount != null) preview(chosen!!, amount) else null
++    val summary = chosen?.let { c -> report?.cards?.firstOrNull { CardPayments.id(it.card) == CardPayments.id(c) } }
++
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(if (step == 1) "Which card did you pay?" else "Check, then confirm") },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                Text("${money(row.txn.amount)} · ${row.txn.merchant} · ${row.txn.dateTime.format(whenFmt)}", style = MaterialTheme.typography.bodyMedium)
++                if (step == 1) {
++                    if (cards.isEmpty()) Text("No cards found yet.")
++                    cards.forEach { c ->
++                        Row(Modifier.fillMaxWidth().clickable { chosen = c }, verticalAlignment = Alignment.CenterVertically) {
++                            RadioButton(selected = chosen?.let { CardPayments.id(it) } == CardPayments.id(c), onClick = { chosen = c })
++                            Text(c.label)
++                        }
++                    }
++                    OutlinedTextField(
++                        value = amountText, onValueChange = { amountText = it }, singleLine = true,
++                        label = { Text("Amount to count for this card") },
++                        supportingText = { Text("Less than the debit for a partial payment. At most ${money(row.txn.amount)}.") },
++                        isError = amount == null || (chosen != null && pv == null),
++                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
++                    )
++                } else if (pv != null) {
++                    Line("Payment amount", money(pv.paymentAmount))
++                    Line("Card", pv.card.label)
++                    Line("Current outstanding", money(pv.currentOutstanding.max(BigDecimal.ZERO)))
++                    Line("Outstanding after", money(pv.projectedOutstanding.max(BigDecimal.ZERO)), emphasize = true)
++                    if (pv.overpays) Text("This is more than the outstanding amount PennyWise has for this card.", style = MaterialTheme.typography.bodySmall)
++                    if (pv.unallocated.signum() > 0) Text("${money(pv.unallocated)} of the debit is not counted for this card.", style = MaterialTheme.typography.bodySmall)
++                    if (summary?.outstanding?.isEstimate == true) Text("The current outstanding is an estimate. Reconcile with your bank's figure for an exact one.", style = MaterialTheme.typography.bodySmall)
++                    Text("Nothing changes until you confirm.", style = MaterialTheme.typography.bodySmall)
++                }
++            }
++        },
++        confirmButton = {
++            if (step == 1) Button(enabled = pv != null, onClick = { step = 2 }) { Text("Next") }
++            else Button(onClick = { onConfirm(chosen!!, amount!!) }) { Text("Confirm payment") }
++        },
++        dismissButton = {
++            if (step == 2) TextButton(onClick = { step = 1 }) { Text("Back") } else TextButton(onClick = onDismiss) { Text("Cancel") }
++        },
++    )
++}
++
++@Composable
++private fun ReconcileDialog(s: CardPaymentSummary, onSave: (BigDecimal) -> Unit, onDismiss: () -> Unit) {
++    var text by remember { mutableStateOf("") }
++    val bank = text.replace(",", "").toBigDecimalOrNull()?.takeIf { it.signum() >= 0 }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text("Reconcile ${s.card.label}") },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                Text("PennyWise calculates ${money(s.outstanding.amount.max(BigDecimal.ZERO))}${if (s.outstanding.isEstimate) " (estimate)" else ""}.")
++                OutlinedTextField(
++                    value = text, onValueChange = { text = it }, singleLine = true,
++                    label = { Text("Outstanding shown by your bank") },
++                    supportingText = { if (bank != null) Text("Difference: ${money(bank - s.outstanding.amount)}") },
++                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
++                )
++                Text("This records a checkpoint. No transactions are added or changed, and earlier checkpoints are kept.", style = MaterialTheme.typography.bodySmall)
++            }
++        },
++        confirmButton = { Button(enabled = bank != null, onClick = { onSave(bank!!) }) { Text("Save") } },
++        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
++    )
++}
++
++@Composable
++private fun ScheduleDialog(s: CardPaymentSummary, onSave: (CardSchedule) -> Unit, onDismiss: () -> Unit) {
++    val cur = s.schedule
++    var dueDay by remember { mutableStateOf(cur?.dueDay?.toString().orEmpty()) }
++    var before by remember { mutableStateOf((cur?.remindDaysBefore ?: listOf(3, 1)).joinToString(", ")) }
++    var onDue by remember { mutableStateOf(cur?.remindOnDue ?: true) }
++    var overdue by remember { mutableStateOf(cur?.overdueAlerts ?: true) }
++    val day = dueDay.toIntOrNull()?.takeIf { it in 1..31 }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text("${s.card.label}: due date") },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedTextField(
++                    value = dueDay, onValueChange = { dueDay = it.filter { c -> c.isDigit() }.take(2) }, singleLine = true,
++                    label = { Text("Bill is due on day of month (1-31)") },
++                    isError = dueDay.isNotEmpty() && day == null,
++                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
++                )
++                OutlinedTextField(
++                    value = before, onValueChange = { before = it }, singleLine = true,
++                    label = { Text("Remind me this many days before") },
++                    supportingText = { Text("For example 5, 2, 1. Leave empty for none.") },
++                )
++                Row(verticalAlignment = Alignment.CenterVertically) { Text("Remind me on the due date", Modifier.weight(1f)); Switch(checked = onDue, onCheckedChange = { onDue = it }) }
++                Row(verticalAlignment = Alignment.CenterVertically) { Text("Alert me when overdue", Modifier.weight(1f)); Switch(checked = overdue, onCheckedChange = { overdue = it }) }
++                Text("A partial payment lowers the amount but does not mark the bill as paid. PennyWise never guesses a due date.", style = MaterialTheme.typography.bodySmall)
++            }
++        },
++        confirmButton = {
++            Button(enabled = dueDay.isEmpty() || day != null, onClick = {
++                val days = before.split(",", " ").mapNotNull { it.trim().toIntOrNull() }.filter { it in 1..31 }.distinct()
++                onSave(CardSchedule(s.card, day, days, onDue, overdue))
++            }) { Text("Save") }
++        },
++        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
++    )
++}
+diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardPaymentsViewModel.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardPaymentsViewModel.kt
+new file mode 100644
+index 00000000..3e86e67c
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardPaymentsViewModel.kt
+@@ -0,0 +1,166 @@
++package com.pennywiseai.tracker.presentation.rotation
++
++import android.content.Context
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import com.pennywiseai.tracker.data.repository.AccountBalanceRepository
++import com.pennywiseai.tracker.data.repository.TransactionRepository
++import com.pennywiseai.tracker.domain.rotation.CardAccount
++import com.pennywiseai.tracker.domain.rotation.CardKey
++import com.pennywiseai.tracker.domain.rotation.CardPayments
++import com.pennywiseai.tracker.domain.rotation.CardSchedule
++import com.pennywiseai.tracker.domain.rotation.PaymentPreview
++import com.pennywiseai.tracker.domain.rotation.PaymentQuestion
++import com.pennywiseai.tracker.domain.rotation.PaymentStatus
++import com.pennywiseai.tracker.domain.rotation.PaymentsReport
++import com.pennywiseai.tracker.domain.rotation.RotationKind
++import com.pennywiseai.tracker.domain.rotation.RotationTxn
++import dagger.hilt.android.lifecycle.HiltViewModel
++import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.FlowPreview
++import kotlinx.coroutines.flow.MutableSharedFlow
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.SharedFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asSharedFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.debounce
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import java.math.BigDecimal
++import java.time.LocalDateTime
++import javax.inject.Inject
++
++data class CardPaymentsUiState(
++    val report: PaymentsReport? = null,
++    /** Recent bank debits not yet treated as card payments, for "I paid a card and it was missed". */
++    val recentDebits: List<RotationTxn> = emptyList(),
++    val isLoading: Boolean = true,
++)
++
++private data class Source(
++    val txns: List<com.pennywiseai.tracker.data.database.entity.TransactionEntity>,
++    val balances: List<com.pennywiseai.tracker.data.database.entity.AccountBalanceEntity>,
++    val inputs: PaymentInputs,
++)
++
++/**
++ * Card-bill payments: pending CRED / NetBanking payments, two-step confirmation, history, reconciliation and
++ * due-date settings. Reads transactions only; it never edits or deletes a transaction. Everything the user
++ * decides is saved in [CardRotationStore].
++ */
++@OptIn(FlowPreview::class)
++@HiltViewModel
++class CardPaymentsViewModel @Inject constructor(
++    private val transactionRepository: TransactionRepository,
++    private val accountBalanceRepository: AccountBalanceRepository,
++    @ApplicationContext context: Context,
++) : ViewModel() {
++
++    private val store = CardRotationStore(context)
++    private val saved = MutableStateFlow(store.paymentInputs())
++    private val _uiState = MutableStateFlow(CardPaymentsUiState())
++    val uiState: StateFlow<CardPaymentsUiState> = _uiState.asStateFlow()
++
++    private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
++    val messages: SharedFlow<String> = _messages.asSharedFlow()
++
++    private var txns: List<RotationTxn> = emptyList()
++    private var accounts: List<CardAccount> = emptyList()
++
++    init {
++        viewModelScope.launch {
++            combine(transactionRepository.getAllTransactions(), accountBalanceRepository.getAllLatestBalances(), saved) { t, b, s -> Source(t, b, s) }
++                .debounce(300)
++                .collect { src ->
++                    val result = withContext(Dispatchers.Default) {
++                        val rows = src.txns.filter { !it.isDeleted && it.currency == "INR" }.mapNotNull { it.toRotationTxn() }
++                        val accts = cardAccountsFrom(src.balances)
++                        val report = buildPaymentsReport(rows, accts, src.inputs)
++                        val inPayments = report.allRows.map { it.txn.id }.toSet()
++                        val cutoff = LocalDateTime.now().minusDays(60)
++                        val recent = rows.filter { it.kind == RotationKind.OUTGOING && it.id !in inPayments && it.dateTime.isAfter(cutoff) }
++                            .sortedByDescending { it.dateTime }.take(40)
++                        Triple(rows, accts, report to recent)
++                    }
++                    txns = result.first
++                    accounts = result.second
++                    _uiState.value = CardPaymentsUiState(report = result.third.first, recentDebits = result.third.second, isLoading = false)
++                }
++        }
++    }
++
++    /** Step 2 of confirmation. Saves nothing. Returns null when the amount is not valid. */
++    fun preview(txn: RotationTxn, card: CardKey, amount: BigDecimal): PaymentPreview? {
++        val report = _uiState.value.report ?: return null
++        val summary = report.cards.firstOrNull { CardPayments.id(it.card) == CardPayments.id(card) } ?: return null
++        return runCatching { CardPayments.preview(txn, card, amount, summary.outstanding) }.getOrNull()
++    }
++
++    /** Called only from the confirmation dialog's final button. */
++    fun confirm(txn: RotationTxn, card: CardKey, amount: BigDecimal) {
++        runCatching { CardPayments.confirm(saved.value.decisions, txn, card, amount, LocalDateTime.now()) }
++            .onSuccess { update { copy(decisions = it) }; _messages.tryEmit("Payment confirmed for ${card.label}") }
++            .onFailure { _messages.tryEmit(it.message ?: "Could not confirm this payment") }
++    }
++
++    fun unassign(txnId: Long) {
++        update { copy(decisions = CardPayments.unassign(decisions, txnId, LocalDateTime.now())) }
++        _messages.tryEmit("Payment moved back to waiting. History kept")
++    }
++
++    fun markStatus(txnId: Long, status: PaymentStatus, note: String) {
++        update { copy(decisions = CardPayments.markStatus(decisions, txnId, status, LocalDateTime.now(), note)) }
++        _messages.tryEmit("Marked ${status.name.lowercase()}")
++    }
++
++    fun notACardPayment(txnId: Long) {
++        update { copy(notCardPayments = notCardPayments + txnId) }
++        _messages.tryEmit("Okay, I won't treat that debit as a card payment")
++    }
++
++    fun dismissReversal(txnId: Long) {
++        update { copy(decisions = CardPayments.dismissReversal(decisions, txnId, LocalDateTime.now())) }
++    }
++
++    /** "Keep both" for a possible duplicate, or "not a reversal" for a possible reversal. */
++    fun answerQuestion(q: PaymentQuestion) {
++        update { copy(answered = answered + questionKey(q)) }
++        if (q is PaymentQuestion.PossibleReversal) dismissReversal(q.txnId)
++    }
++
++    fun flagDuplicate(txnId: Long) {
++        update { copy(decisions = CardPayments.markStatus(decisions, txnId, PaymentStatus.DUPLICATE, LocalDateTime.now(), "Marked as a duplicate by user")) }
++        _messages.tryEmit("Marked as a duplicate. It no longer counts")
++    }
++
++    fun reconcile(card: CardKey, bankOutstanding: BigDecimal) {
++        val summary = _uiState.value.report?.cards?.firstOrNull { CardPayments.id(it.card) == CardPayments.id(card) } ?: return
++        runCatching { CardPayments.reconcile(saved.value.reconciliations, card, bankOutstanding, LocalDateTime.now(), summary.outstanding.amount) }
++            .onSuccess {
++                update { copy(reconciliations = it) }
++                val diff = it.last().difference
++                _messages.tryEmit(if (diff.signum() == 0) "Matches your bank. Reconciled" else "Saved. Difference from PennyWise: ${diff.toPlainString()}")
++            }
++            .onFailure { _messages.tryEmit(it.message ?: "Could not save") }
++    }
++
++    fun saveSchedule(schedule: CardSchedule) {
++        update {
++            copy(schedules = schedules.filter { CardPayments.id(it.card) != CardPayments.id(schedule.card) } + schedule)
++        }
++        _messages.tryEmit("Due date and reminders saved")
++    }
++
++    private fun update(change: PaymentInputs.() -> PaymentInputs) {
++        val next = saved.value.change()
++        store.savePaymentDecisions(next.decisions)
++        store.saveReconciliations(next.reconciliations)
++        store.saveSchedules(next.schedules)
++        store.saveNotCardPayments(next.notCardPayments)
++        store.saveAnsweredQuestions(next.answered)
++        saved.value = next
++    }
++}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationScreen.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationScreen.kt
 new file mode 100644
 index 00000000..21da1efc
@@ -1094,14 +2227,17 @@ index 00000000..21da1efc
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationStore.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationStore.kt
 new file mode 100644
-index 00000000..5fd42ce3
+index 00000000..c5917fba
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CardRotationStore.kt
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,134 @@
 +package com.pennywiseai.tracker.presentation.rotation
 +
 +import android.content.Context
-+import com.pennywiseai.tracker.domain.rotation.CardKey
++import com.pennywiseai.tracker.domain.rotation.CardSchedule
++import com.pennywiseai.tracker.domain.rotation.PaymentCodec
++import com.pennywiseai.tracker.domain.rotation.PaymentDecision
++import com.pennywiseai.tracker.domain.rotation.Reconciliation
 +import com.pennywiseai.tracker.domain.rotation.ManualLink
 +import com.pennywiseai.tracker.domain.rotation.OnwardUse
 +
@@ -1159,18 +2295,52 @@ index 00000000..5fd42ce3
 +        get() = prefs.getInt(KEY_WINDOW, DEFAULT_WINDOW_HOURS)
 +        set(value) { prefs.edit().putInt(KEY_WINDOW, value.coerceIn(1, 168)).apply() }
 +
-+    /** Card-bill payments the user tied to a card by hand (CRED / UPI payments carry no card digits). */
-+    fun assignments(): Map<Long, CardKey> =
-+        prefs.getStringSet(KEY_ASSIGN, emptySet()).orEmpty().mapNotNull { raw ->
-+            val p = raw.split("|", limit = 3)
-+            val id = p.getOrNull(0)?.toLongOrNull() ?: return@mapNotNull null
-+            val bank = p.getOrNull(1) ?: return@mapNotNull null
-+            val last4 = p.getOrNull(2) ?: return@mapNotNull null
-+            id to CardKey(bank, last4)
-+        }.toMap()
++    // ---- credit-card bill payments: the user's decisions (see CardPayments) -------------------------------
 +
-+    fun saveAssignments(v: Map<Long, CardKey>) {
-+        prefs.edit().putStringSet(KEY_ASSIGN, v.map { (id, c) -> "$id|${c.bank}|${c.last4}" }.toSet()).apply()
++    /** Confirmed / failed / reversed / unassigned payments, with their history. Pending ones are not stored. */
++    fun paymentDecisions(): Map<Long, PaymentDecision> =
++        PaymentCodec.decodeDecisions(prefs.getStringSet(KEY_PAY_DECISIONS, emptySet()).orEmpty())
++
++    fun savePaymentDecisions(v: Map<Long, PaymentDecision>) {
++        prefs.edit().putStringSet(KEY_PAY_DECISIONS, v.values.map { PaymentCodec.encode(it) }.toSet()).apply()
++    }
++
++    /** Every time the user entered the bank's actual outstanding; history is never overwritten. */
++    fun reconciliations(): List<Reconciliation> =
++        prefs.getStringSet(KEY_RECON, emptySet()).orEmpty().mapNotNull { PaymentCodec.decodeReconciliation(it) }
++
++    fun saveReconciliations(v: List<Reconciliation>) {
++        prefs.edit().putStringSet(KEY_RECON, v.map { PaymentCodec.encode(it) }.toSet()).apply()
++    }
++
++    /** Due day and reminder choices, one per card. */
++    fun schedules(): List<CardSchedule> =
++        prefs.getStringSet(KEY_SCHEDULES, emptySet()).orEmpty().mapNotNull { PaymentCodec.decodeSchedule(it) }
++
++    fun saveSchedules(v: List<CardSchedule>) {
++        prefs.edit().putStringSet(KEY_SCHEDULES, v.map { PaymentCodec.encode(it) }.toSet()).apply()
++    }
++
++    /** Debits the user said are NOT card payments, so they are not asked about again. */
++    fun notCardPayments(): Set<Long> = longs(KEY_NOT_PAYMENT)
++
++    fun saveNotCardPayments(v: Set<Long>) {
++        prefs.edit().putStringSet(KEY_NOT_PAYMENT, v.map { it.toString() }.toSet()).apply()
++    }
++
++    /** "Keep both" answers to possible-duplicate and possible-reversal questions. */
++    fun answeredQuestions(): Set<String> = prefs.getStringSet(KEY_ANSWERED, emptySet()).orEmpty()
++
++    fun saveAnsweredQuestions(v: Set<String>) {
++        prefs.edit().putStringSet(KEY_ANSWERED, v).apply()
++    }
++
++    /** Due-date alerts already shown (stable keys), so each is announced once. */
++    fun dueAlertsSent(): Set<String> = prefs.getStringSet(KEY_DUE_SENT, emptySet()).orEmpty()
++
++    fun addDueAlertsSent(keys: Collection<String>) {
++        val merged = (dueAlertsSent() + keys).toList().takeLast(MAX_NOTIFIED)
++        prefs.edit().putStringSet(KEY_DUE_SENT, merged.toSet()).apply()
 +    }
 +
 +    private fun longs(key: String): Set<Long> =
@@ -1184,7 +2354,12 @@ index 00000000..5fd42ce3
 +        const val KEY_REMIND = "reminders"
 +        const val KEY_ASK_MIN = "ask_min"
 +        const val KEY_WINDOW = "window_hours"
-+        const val KEY_ASSIGN = "assign"
++        const val KEY_PAY_DECISIONS = "pay_decisions"
++        const val KEY_RECON = "reconciliations"
++        const val KEY_SCHEDULES = "schedules"
++        const val KEY_NOT_PAYMENT = "not_payment"
++        const val KEY_ANSWERED = "answered_questions"
++        const val KEY_DUE_SENT = "due_alerts_sent"
 +        const val DEFAULT_ASK_MIN = 5000
 +        const val DEFAULT_WINDOW_HOURS = 24
 +        const val MAX_NOTIFIED = 500
@@ -1410,10 +2585,10 @@ index 00000000..731cc2f5
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsHomeEntry.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsHomeEntry.kt
 new file mode 100644
-index 00000000..595dcfcd
+index 00000000..50f9c338
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsHomeEntry.kt
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,62 @@
 +package com.pennywiseai.tracker.presentation.rotation
 +
 +import androidx.compose.foundation.clickable
@@ -1426,26 +2601,51 @@ index 00000000..595dcfcd
 +import androidx.compose.material3.MaterialTheme
 +import androidx.compose.material3.Text
 +import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.text.font.FontWeight
 +import androidx.compose.ui.unit.dp
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import java.text.NumberFormat
++import java.util.Locale
 +
-+/** Home shortcut to the credit-card dashboard, shown right under the "Money in motion" card. */
++private val inr: NumberFormat = NumberFormat.getCurrencyInstance(Locale.Builder().setLanguage("en").setRegion("IN").build())
++
++/**
++ * Home shortcut to the credit-card dashboard, shown right under the "Money in motion" card. It carries the
++ * confirmed card payments of this month and how many payments still wait for an answer.
++ */
 +@Composable
-+fun CreditCardsHomeEntry(onClick: () -> Unit, modifier: Modifier = Modifier) {
++fun CreditCardsHomeEntry(
++    onClick: () -> Unit,
++    modifier: Modifier = Modifier,
++    viewModel: CardPaymentsViewModel = hiltViewModel(),
++) {
++    val state by viewModel.uiState.collectAsStateWithLifecycle()
++    val report = state.report
 +    Card(modifier = modifier.fillMaxWidth().clickable(onClick = onClick)) {
 +        Row(
 +            Modifier.fillMaxWidth().padding(16.dp),
 +            horizontalArrangement = Arrangement.SpaceBetween,
 +            verticalAlignment = Alignment.CenterVertically,
 +        ) {
-+            Column {
++            Column(Modifier.weight(1f)) {
 +                Text("Credit cards", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
 +                Text(
-+                    "Spent, paid, outstanding and rotation per card",
++                    if (report == null) "Spent, paid, outstanding and rotation per card"
++                    else "Paid to cards this month: ${inr.format(report.confirmedThisMonth)} (confirmed)",
 +                    style = MaterialTheme.typography.bodySmall,
 +                )
++                if (report != null && (report.pending.isNotEmpty() || report.questions.isNotEmpty())) {
++                    Text(
++                        "${report.pending.size} payment(s) waiting for your confirmation" +
++                            (if (report.questions.isNotEmpty()) ", ${report.questions.size} to check" else ""),
++                        style = MaterialTheme.typography.bodySmall,
++                        fontWeight = FontWeight.SemiBold,
++                    )
++                }
 +            }
 +            Text("›", style = MaterialTheme.typography.titleLarge)
 +        }
@@ -1453,14 +2653,13 @@ index 00000000..595dcfcd
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsScreen.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsScreen.kt
 new file mode 100644
-index 00000000..32a9ff85
+index 00000000..383b1984
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsScreen.kt
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,196 @@
 +package com.pennywiseai.tracker.presentation.rotation
 +
 +import androidx.compose.foundation.layout.Arrangement
-+import androidx.compose.foundation.layout.Box
 +import androidx.compose.foundation.layout.Column
 +import androidx.compose.foundation.layout.PaddingValues
 +import androidx.compose.foundation.layout.Row
@@ -1472,8 +2671,6 @@ index 00000000..32a9ff85
 +import androidx.compose.material.icons.automirrored.filled.ArrowBack
 +import androidx.compose.material3.Button
 +import androidx.compose.material3.Card
-+import androidx.compose.material3.DropdownMenu
-+import androidx.compose.material3.DropdownMenuItem
 +import androidx.compose.material3.ExperimentalMaterial3Api
 +import androidx.compose.material3.HorizontalDivider
 +import androidx.compose.material3.Icon
@@ -1496,9 +2693,8 @@ index 00000000..32a9ff85
 +import androidx.lifecycle.compose.collectAsStateWithLifecycle
 +import com.pennywiseai.tracker.domain.rotation.ActivityKind
 +import com.pennywiseai.tracker.domain.rotation.CardActivity
-+import com.pennywiseai.tracker.domain.rotation.CardKey
 +import com.pennywiseai.tracker.domain.rotation.CardSummary
-+import com.pennywiseai.tracker.domain.rotation.UnassignedPayment
++import com.pennywiseai.tracker.domain.rotation.PaymentStatus
 +import java.math.BigDecimal
 +import java.text.NumberFormat
 +import java.time.format.DateTimeFormatter
@@ -1513,6 +2709,7 @@ index 00000000..32a9ff85
 +fun CreditCardsScreen(
 +    onNavigateBack: () -> Unit,
 +    onOpenRotation: () -> Unit,
++    onOpenPayments: () -> Unit,
 +    viewModel: CreditCardsViewModel = hiltViewModel(),
 +) {
 +    val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -1550,13 +2747,22 @@ index 00000000..32a9ff85
 +                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
 +                            Text("All cards · this month", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
 +                            Line("Spent", money(report.spentMonth))
-+                            Line("Paid to cards", money(report.paidMonth))
++                            Line("Paid to cards (confirmed)", money(report.confirmedPaidThisMonth))
 +                            Line("Outstanding now", money(report.outstanding), emphasize = true)
 +                            if (report.rotationCharges.signum() > 0) Line("Rotation charges paid", money(report.rotationCharges))
 +                            Text(
-+                                "Outstanding uses the bank's own figure where its SMS gave one, otherwise spent minus paid.",
++                                if (report.hasEstimates) "Some cards show an estimate because there is no bank figure yet. Open Card payments and reconcile."
++                                else "Outstanding comes from the bank's figure plus later spends minus later confirmed payments.",
 +                                style = MaterialTheme.typography.bodySmall,
 +                            )
++                            if (report.pending.isNotEmpty() || report.questions > 0) {
++                                Text(
++                                    "${report.pending.size} payment(s) worth ${money(report.pendingAmount)} wait for your confirmation" +
++                                        (if (report.questions > 0) " and ${report.questions} need a check." else "."),
++                                    style = MaterialTheme.typography.bodyMedium,
++                                    fontWeight = FontWeight.SemiBold,
++                                )
++                            }
 +                        }
 +                    }
 +                }
@@ -1566,6 +2772,7 @@ index 00000000..32a9ff85
 +                        else OutlinedButton(onClick = { showAll = false }) { Text("This month") }
 +                        if (showAll) Button(onClick = { showAll = true }) { Text("All time") }
 +                        else OutlinedButton(onClick = { showAll = true }) { Text("All time") }
++                        OutlinedButton(onClick = onOpenPayments) { Text("Card payments") }
 +                        OutlinedButton(onClick = onOpenRotation) { Text("Card rotation") }
 +                    }
 +                }
@@ -1577,22 +2784,6 @@ index 00000000..32a9ff85
 +                        open = open,
 +                        onToggle = { expanded = if (open) expanded - c.card.label else expanded + c.card.label },
 +                    )
-+                }
-+                if (report.unassigned.isNotEmpty()) {
-+                    item {
-+                        Text(
-+                            "Card payments not matched to a card (${money(report.unassignedPaid)})",
-+                            style = MaterialTheme.typography.titleMedium,
-+                            fontWeight = FontWeight.SemiBold,
-+                        )
-+                        Text(
-+                            "CRED and UPI payments don't say which card they paid. Pick the card so its Paid and Outstanding are right.",
-+                            style = MaterialTheme.typography.bodySmall,
-+                        )
-+                    }
-+                    items(report.unassigned.take(15), key = { "pay-${it.id}" }) { p ->
-+                        UnassignedRow(p, report.cards.map { it.card }, onAssign = { card -> viewModel.assignPayment(p.id, card) })
-+                    }
 +                }
 +            }
 +        }
@@ -1609,12 +2800,15 @@ index 00000000..32a9ff85
 +            }
 +            Line(if (showAll) "Spent (all time)" else "Spent this month", money(if (showAll) c.spentAll else c.spentMonth))
 +            Line(if (showAll) "Paid (all time)" else "Paid this month", money(if (showAll) c.paidAll else c.paidMonth))
-+            if (c.outstanding != null) {
-+                Line("Outstanding (bank)", money(c.outstanding), emphasize = true)
-+                c.limit?.let { Line("Available credit", money((it - c.outstanding).max(BigDecimal.ZERO))) }
++            if (c.outstanding.isEstimate) {
++                Line("Outstanding (estimate)", money(c.outstanding.amount.max(BigDecimal.ZERO)), emphasize = true)
++                Text("History is incomplete, so this is not exact. Reconcile on the Card payments screen.", style = MaterialTheme.typography.bodySmall)
 +            } else {
-+                Line("Estimated owed", money(c.estimatedOwed), emphasize = true)
++                Line("Outstanding", money(c.outstanding.amount.max(BigDecimal.ZERO)), emphasize = true)
++                c.limit?.let { Line("Available credit", money((it - c.outstanding.amount).max(BigDecimal.ZERO))) }
 +            }
++            if (c.partiallyPaid) Text("Partly paid. A partial payment does not clear the bill.", style = MaterialTheme.typography.bodySmall)
++            else if (c.paidInFull) Text("Paid in full.", style = MaterialTheme.typography.bodySmall)
 +            if (c.rotated.signum() > 0) {
 +                HorizontalDivider(Modifier.padding(vertical = 2.dp))
 +                Line("Rotated through gateways", money(c.rotated))
@@ -1632,7 +2826,13 @@ index 00000000..32a9ff85
 +private fun ActivityRow(a: CardActivity) {
 +    val label = when (a.kind) {
 +        ActivityKind.SPEND -> "Spent"
-+        ActivityKind.PAYMENT -> "Paid"
++        ActivityKind.PAYMENT -> when (a.status) {
++            PaymentStatus.REVERSED -> "Payment reversed"
++            PaymentStatus.FAILED -> "Payment failed"
++            PaymentStatus.DUPLICATE -> "Duplicate payment, not counted"
++            PaymentStatus.PENDING -> "Payment waiting for confirmation"
++            else -> "Paid"
++        }
 +        ActivityKind.ROTATION_SPEND -> "Rotation spend"
 +        ActivityKind.ROTATION_CREDIT -> "Rotation credit to bank"
 +        ActivityKind.ROTATION_ONWARD -> "Rotation: paid onward"
@@ -1653,33 +2853,12 @@ index 00000000..32a9ff85
 +        Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = if (emphasize) FontWeight.SemiBold else FontWeight.Normal)
 +    }
 +}
-+
-+@Composable
-+private fun UnassignedRow(p: UnassignedPayment, cards: List<CardKey>, onAssign: (CardKey) -> Unit) {
-+    var menu by remember { mutableStateOf(false) }
-+    Card(modifier = Modifier.fillMaxWidth()) {
-+        Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-+            Column(Modifier.weight(1f)) {
-+                Text(p.title, style = MaterialTheme.typography.bodyMedium, maxLines = 1)
-+                Text("${p.at.format(dayFmt)} · ${money(p.amount)}", style = MaterialTheme.typography.bodySmall)
-+            }
-+            Box {
-+                TextButton(onClick = { menu = true }) { Text("Assign to card") }
-+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-+                    cards.forEach { c ->
-+                        DropdownMenuItem(text = { Text(c.label) }, onClick = { menu = false; onAssign(c) })
-+                    }
-+                }
-+            }
-+        }
-+    }
-+}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsViewModel.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsViewModel.kt
 new file mode 100644
-index 00000000..ad6a04c4
+index 00000000..299ad45d
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/CreditCardsViewModel.kt
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,58 @@
 +package com.pennywiseai.tracker.presentation.rotation
 +
 +import android.content.Context
@@ -1687,9 +2866,7 @@ index 00000000..ad6a04c4
 +import androidx.lifecycle.viewModelScope
 +import com.pennywiseai.tracker.data.repository.AccountBalanceRepository
 +import com.pennywiseai.tracker.data.repository.TransactionRepository
-+import com.pennywiseai.tracker.domain.rotation.CardAccount
 +import com.pennywiseai.tracker.domain.rotation.CardDashboard
-+import com.pennywiseai.tracker.domain.rotation.CardKey
 +import com.pennywiseai.tracker.domain.rotation.CardRotation
 +import com.pennywiseai.tracker.domain.rotation.DashboardReport
 +import dagger.hilt.android.lifecycle.HiltViewModel
@@ -1720,34 +2897,84 @@ index 00000000..ad6a04c4
 +) : ViewModel() {
 +
 +    private val store = CardRotationStore(context)
-+    private val assignments = MutableStateFlow(store.assignments())
 +    private val _uiState = MutableStateFlow(CreditCardsUiState())
 +    val uiState: StateFlow<CreditCardsUiState> = _uiState.asStateFlow()
 +
 +    init {
 +        viewModelScope.launch {
-+            combine(transactionRepository.getAllTransactions(), accountBalanceRepository.getAllLatestBalances(), assignments) { tx, acc, a -> Triple(tx, acc, a) }
++            combine(transactionRepository.getAllTransactions(), accountBalanceRepository.getAllLatestBalances()) { tx, acc -> tx to acc }
 +                .debounce(300)
-+                .collect { (tx, acc, assigned) ->
-+                    val rows = tx.filter { !it.isDeleted && it.currency == "INR" }
++                .collect { (tx, acc) ->
 +                    val report = withContext(Dispatchers.Default) {
-+                        val txns = rows.mapNotNull { it.toRotationTxn() }
-+                        val rotation = CardRotation.analyze(txns, links = store.links(), dismissedOutIds = store.dismissed())
-+                        val cards = acc.filter { it.isCreditCard }
-+                            .map { CardAccount(it.bankName, it.accountLast4, it.balance, it.creditLimit) }
-+                        CardDashboard.build(txns, cards, rotation, assignments = assigned)
++                        val rows = tx.filter { !it.isDeleted && it.currency == "INR" }.mapNotNull { it.toRotationTxn() }
++                        val rotation = CardRotation.analyze(rows, links = store.links(), dismissedOutIds = store.dismissed())
++                        // The same payments report the Card payments screen uses, so the two can never disagree.
++                        val payments = buildPaymentsReport(rows, cardAccountsFrom(acc), store.paymentInputs())
++                        CardDashboard.build(rows, rotation, payments)
 +                    }
 +                    _uiState.value = CreditCardsUiState(report = report, isLoading = false)
 +                }
 +        }
 +    }
++}
+diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/PaymentsSupport.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/PaymentsSupport.kt
+new file mode 100644
+index 00000000..ffad9f70
+--- /dev/null
++++ b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/PaymentsSupport.kt
+@@ -0,0 +1,53 @@
++package com.pennywiseai.tracker.presentation.rotation
 +
-+    /** Tie a card-bill payment (e.g. "CRED Club") to the card it paid, so that card's "Paid" is right. */
-+    fun assignPayment(paymentId: Long, card: CardKey) {
-+        val next = assignments.value + (paymentId to card)
-+        store.saveAssignments(next)
-+        assignments.value = next
-+    }
++import com.pennywiseai.tracker.data.database.entity.AccountBalanceEntity
++import com.pennywiseai.tracker.domain.rotation.CardAccount
++import com.pennywiseai.tracker.domain.rotation.CardPayments
++import com.pennywiseai.tracker.domain.rotation.CardSchedule
++import com.pennywiseai.tracker.domain.rotation.PaymentDecision
++import com.pennywiseai.tracker.domain.rotation.PaymentQuestion
++import com.pennywiseai.tracker.domain.rotation.PaymentsReport
++import com.pennywiseai.tracker.domain.rotation.Reconciliation
++import com.pennywiseai.tracker.domain.rotation.RotationKind
++import com.pennywiseai.tracker.domain.rotation.RotationTxn
++import java.time.LocalDateTime
++
++/** The user's saved choices about card payments, read once so every screen computes from the same inputs. */
++data class PaymentInputs(
++    val decisions: Map<Long, PaymentDecision>,
++    val reconciliations: List<Reconciliation>,
++    val schedules: List<CardSchedule>,
++    val notCardPayments: Set<Long>,
++    val answered: Set<String>,
++)
++
++fun CardRotationStore.paymentInputs() = PaymentInputs(
++    decisions = paymentDecisions(),
++    reconciliations = reconciliations(),
++    schedules = schedules(),
++    notCardPayments = notCardPayments(),
++    answered = answeredQuestions(),
++)
++
++/** Credit-card accounts with the time of the bank's own outstanding figure. */
++fun cardAccountsFrom(balances: List<AccountBalanceEntity>): List<CardAccount> =
++    balances.filter { it.isCreditCard }
++        .map { CardAccount(it.bankName, it.accountLast4, it.balance, it.creditLimit, it.timestamp) }
++
++fun questionKey(q: PaymentQuestion): String = when (q) {
++    is PaymentQuestion.PossibleDuplicate -> "dup:${q.txnId}:${q.otherTxnId}"
++    is PaymentQuestion.PossibleReversal -> "rev:${q.txnId}:${q.creditTxnId}"
++}
++
++/** Builds the single payments report every screen and the reminder worker use. */
++fun buildPaymentsReport(
++    txns: List<RotationTxn>,
++    accounts: List<CardAccount>,
++    inputs: PaymentInputs,
++    now: LocalDateTime = LocalDateTime.now(),
++): PaymentsReport {
++    // Debits the user said are not card payments are left out of payment detection altogether.
++    val usable = txns.filterNot { it.kind == RotationKind.OUTGOING && it.id in inputs.notCardPayments && it.id !in inputs.decisions }
++    val raw = CardPayments.report(usable, accounts, inputs.decisions, inputs.reconciliations, inputs.schedules, now)
++    return raw.copy(questions = raw.questions.filter { questionKey(it) !in inputs.answered })
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/RotationMapping.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/rotation/RotationMapping.kt
 new file mode 100644
@@ -1782,7 +3009,7 @@ index 00000000..d52002f5
 +    )
 +}
 diff --git a/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt b/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt
-index 29f92693..d15d4dc0 100644
+index 1cc90697..cf0f5814 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/presentation/transactions/TransactionsViewModel.kt
 @@ -436,7 +436,9 @@ class TransactionsViewModel @Inject constructor(
@@ -1805,7 +3032,7 @@ index 29f92693..d15d4dc0 100644
              val fromAcct = expense.accountNumber
              val toAcct = income.accountNumber
  
-@@ -1695,7 +1697,10 @@ private data class BudgetParams(
+@@ -1696,7 +1698,10 @@ private data class BudgetParams(
   */
  internal fun computeSelfTransferPairs(
      txns: List<TransactionEntity>,
@@ -1817,7 +3044,7 @@ index 29f92693..d15d4dc0 100644
  ): Map<Long, Long> {
      if (txns.size < 2) return emptyMap()
      val acctOf: (TransactionEntity) -> String? = { tx ->
-@@ -1715,7 +1720,11 @@ internal fun computeSelfTransferPairs(
+@@ -1716,7 +1721,11 @@ internal fun computeSelfTransferPairs(
      val pair = HashMap<Long, Long>(txns.size / 8)
      val claimedIncome = HashSet<Long>()
      for (expense in txns) {
@@ -1830,7 +3057,7 @@ index 29f92693..d15d4dc0 100644
          val candidates = incomesByKey[expense.currency to expense.amount] ?: continue
          // Closest in time within the window, not on the same known account, not
          // already claimed by another expense.
-@@ -1729,7 +1738,7 @@ internal fun computeSelfTransferPairs(
+@@ -1730,7 +1739,7 @@ internal fun computeSelfTransferPairs(
              }
              .filter {
                  java.time.Duration.between(expense.dateTime, it.dateTime)
@@ -1840,7 +3067,7 @@ index 29f92693..d15d4dc0 100644
              .minByOrNull {
                  kotlin.math.abs(
 diff --git a/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt b/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt
-index 45e758d8..fa7b0af4 100644
+index 8fb3cea6..4cb8d775 100644
 --- a/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt
 +++ b/app/src/main/java/com/pennywiseai/tracker/ui/MainScreen.kt
 @@ -212,6 +212,11 @@ fun MainScreen(
@@ -1912,10 +3139,10 @@ index 24ee4959..050cadff 100644
                      iconBgColor = green_light,
 diff --git a/app/src/main/java/com/pennywiseai/tracker/worker/CardCreditCheckWorker.kt b/app/src/main/java/com/pennywiseai/tracker/worker/CardCreditCheckWorker.kt
 new file mode 100644
-index 00000000..85fdf1dc
+index 00000000..58186c43
 --- /dev/null
 +++ b/app/src/main/java/com/pennywiseai/tracker/worker/CardCreditCheckWorker.kt
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,165 @@
 +package com.pennywiseai.tracker.worker
 +
 +import android.app.NotificationChannel
@@ -1932,7 +3159,14 @@ index 00000000..85fdf1dc
 +import androidx.work.WorkerParameters
 +import com.pennywiseai.tracker.MainActivity
 +import com.pennywiseai.tracker.R
++import com.pennywiseai.tracker.data.repository.AccountBalanceRepository
 +import com.pennywiseai.tracker.data.repository.TransactionRepository
++import com.pennywiseai.tracker.domain.rotation.CardPayments
++import com.pennywiseai.tracker.domain.rotation.DueAlertKind
++import com.pennywiseai.tracker.domain.rotation.RotationTxn
++import com.pennywiseai.tracker.presentation.rotation.buildPaymentsReport
++import com.pennywiseai.tracker.presentation.rotation.cardAccountsFrom
++import com.pennywiseai.tracker.presentation.rotation.paymentInputs
 +import com.pennywiseai.tracker.domain.rotation.CardRotation
 +import com.pennywiseai.tracker.domain.rotation.CreditReminder
 +import com.pennywiseai.tracker.presentation.rotation.CardRotationStore
@@ -1951,22 +3185,51 @@ index 00000000..85fdf1dc
 + * its credit SMS to arrive, the user is asked once "was a credit missed?"; tapping opens Card rotation.
 + * It reads the same data as the screen and does not touch the SMS receiver.
 + */
++/**
++ * Hourly background checks for credit cards:
++ *  1. a card spend that never got a matching bank credit ("was a credit missed?"), asked once;
++ *  2. bill due dates the user set per card (before, on the day, overdue), each announced once.
++ * Reads the same data as the screens and never touches the SMS receiver.
++ */
 +@HiltWorker
 +class CardCreditCheckWorker @AssistedInject constructor(
 +    @Assisted appContext: Context,
 +    @Assisted workerParams: WorkerParameters,
 +    private val transactionRepository: TransactionRepository,
++    private val accountBalanceRepository: AccountBalanceRepository,
 +) : CoroutineWorker(appContext, workerParams) {
 +
 +    override suspend fun doWork(): Result {
 +        val context = applicationContext
 +        val store = CardRotationStore(context)
-+        if (!store.remindersEnabled) return Result.success()
++        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
++        // Nothing to say if the user turned notifications off; try again next run.
++        if (!notificationManager.areNotificationsEnabled()) return Result.success()
 +
 +        val now = LocalDateTime.now()
-+        val rows = transactionRepository.getAllTransactions().first().filter { !it.isDeleted && it.currency == "INR" }
++        val rows = transactionRepository.getAllTransactions().first()
++            .filter { !it.isDeleted && it.currency == "INR" }
++            .mapNotNull { it.toRotationTxn() }
++        notificationManager.createNotificationChannel(
++            NotificationChannel(CHANNEL_ID, "Card rotation reminders", NotificationManager.IMPORTANCE_DEFAULT).apply {
++                description = "Missing credits and credit-card bill due dates"
++            },
++        )
++        if (store.remindersEnabled) checkMissingCredits(store, notificationManager, rows, now)
++        checkDueDates(store, notificationManager, rows, now)
++        return Result.success()
++    }
++
++    private fun openIntent(extra: String): PendingIntent {
++        val open = Intent(applicationContext, MainActivity::class.java)
++            .putExtra(extra, true)
++            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
++        return PendingIntent.getActivity(applicationContext, extra.hashCode(), open, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
++    }
++
++    private fun checkMissingCredits(store: CardRotationStore, nm: NotificationManager, rows: List<RotationTxn>, now: LocalDateTime) {
 +        val report = CardRotation.analyze(
-+            rows.mapNotNull { it.toRotationTxn() },
++            rows,
 +            links = store.links(),
 +            dismissedOutIds = store.dismissed(),
 +            askMinAmount = BigDecimal(store.askMinAmount),
@@ -1975,17 +3238,7 @@ index 00000000..85fdf1dc
 +            asOf = now,
 +        )
 +        val due = CreditReminder.due(report, store.notified(), now)
-+        if (due.isEmpty()) return Result.success()
-+
-+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-+        // Nothing to say if the user turned notifications off; try again next run.
-+        if (!notificationManager.areNotificationsEnabled()) return Result.success()
-+
-+        notificationManager.createNotificationChannel(
-+            NotificationChannel(CHANNEL_ID, "Card rotation reminders", NotificationManager.IMPORTANCE_DEFAULT).apply {
-+                description = "Asks when a credit-card spend has no matching bank credit"
-+            },
-+        )
++        if (due.isEmpty()) return
 +        val inr = NumberFormat.getCurrencyInstance(Locale.Builder().setLanguage("en").setRegion("IN").build())
 +        val text = if (due.size == 1) {
 +            val d = due.first()
@@ -1994,22 +3247,51 @@ index 00000000..85fdf1dc
 +            val total = due.fold(BigDecimal.ZERO) { a, d -> a + d.spent }
 +            "${due.size} card spends (${inr.format(total)}) have no matching credit. Tap to review."
 +        }
-+        val open = Intent(context, MainActivity::class.java)
-+            .putExtra(MainActivity.EXTRA_OPEN_CARD_ROTATION, true)
-+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
++        val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
 +            .setSmallIcon(R.drawable.ic_launcher_foreground)
 +            .setContentTitle("Was a credit missed?")
 +            .setContentText(text)
 +            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
-+            .setContentIntent(PendingIntent.getActivity(context, NOTIFICATION_ID, open, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
++            .setContentIntent(openIntent(MainActivity.EXTRA_OPEN_CARD_ROTATION))
 +            .setAutoCancel(true)
 +            // Amounts stay off the lock screen, like the other alerts.
 +            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
 +            .build()
-+        notificationManager.notify(NOTIFICATION_ID, notification)
++        nm.notify(NOTIFICATION_ID, notification)
 +        store.addNotified(due.map { it.outId })
-+        return Result.success()
++    }
++
++    private suspend fun checkDueDates(store: CardRotationStore, nm: NotificationManager, rows: List<RotationTxn>, now: LocalDateTime) {
++        // Quiet hours: nothing between 10 PM and 8 AM; the alert waits for the morning.
++        if (now.hour < 8 || now.hour >= 22) return
++        val inputs = store.paymentInputs()
++        if (inputs.schedules.none { it.dueDay != null }) return
++        val accounts = cardAccountsFrom(accountBalanceRepository.getAllLatestBalancesOnce())
++        val report = buildPaymentsReport(rows, accounts, inputs, now)
++        val outstanding = report.cards.associate { CardPayments.id(it.card) to it.outstanding }
++        val alerts = CardPayments.dueAlerts(inputs.schedules, outstanding, now.toLocalDate(), store.dueAlertsSent())
++        if (alerts.isEmpty()) return
++        val inr = NumberFormat.getCurrencyInstance(Locale.Builder().setLanguage("en").setRegion("IN").build())
++        val lines = alerts.map { a ->
++            val owed = outstanding[CardPayments.id(a.card)]?.takeIf { !it.isEstimate }?.amount?.max(BigDecimal.ZERO)?.let { " (${inr.format(it)} outstanding)" }.orEmpty()
++            when (a.kind) {
++                DueAlertKind.BEFORE -> "${a.card.label}: bill due in ${a.daysBefore} day(s), on ${a.dueDate}$owed"
++                DueAlertKind.ON_DUE -> "${a.card.label}: bill is due today$owed"
++                DueAlertKind.OVERDUE -> "${a.card.label}: bill was due on ${a.dueDate} and is still unpaid$owed"
++            }
++        }
++        val text = lines.joinToString("\n")
++        val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
++            .setSmallIcon(R.drawable.ic_launcher_foreground)
++            .setContentTitle(if (alerts.any { it.kind == DueAlertKind.OVERDUE }) "Credit card bill overdue" else "Credit card bill due")
++            .setContentText(lines.first())
++            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
++            .setContentIntent(openIntent(MainActivity.EXTRA_OPEN_CARD_PAYMENTS))
++            .setAutoCancel(true)
++            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
++            .build()
++        nm.notify(DUE_NOTIFICATION_ID, notification)
++        store.addDueAlertsSent(alerts.map { it.key })
 +    }
 +
 +    companion object {
@@ -2017,6 +3299,7 @@ index 00000000..85fdf1dc
 +        private const val CHANNEL_ID = "card_rotation_reminders"
 +        // Transaction alerts use the transaction id and the recap uses -2; ids are never below -2 here.
 +        private const val NOTIFICATION_ID = -3
++        private const val DUE_NOTIFICATION_ID = -4
 +
 +        fun enqueuePeriodic(context: Context) {
 +            val request = PeriodicWorkRequestBuilder<CardCreditCheckWorker>(1, TimeUnit.HOURS).build()
@@ -2025,12 +3308,437 @@ index 00000000..85fdf1dc
 +        }
 +    }
 +}
+diff --git a/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardPaymentsTest.kt b/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardPaymentsTest.kt
+new file mode 100644
+index 00000000..03f434dd
+--- /dev/null
++++ b/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardPaymentsTest.kt
+@@ -0,0 +1,419 @@
++package com.pennywiseai.tracker.domain.rotation
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.math.BigDecimal
++import java.time.LocalDate
++import java.time.LocalDateTime
++
++/** Regression tests for CRED / card-bill payments. Synthetic data only. */
++class CardPaymentsTest {
++    private val t0 = LocalDateTime.of(2026, 10, 20, 10, 0)
++    private val cardA = CardKey("HDFC Bank", "1058")
++    private val cardB = CardKey("ICICI Bank", "6001")
++
++    private fun d(v: String) = BigDecimal(v)
++
++    private fun spend(id: Long, amount: String, card: CardKey = cardA, min: Long = 0) =
++        RotationTxn(id, d(amount), "Shop", RotationKind.CARD_PURCHASE, t0.plusMinutes(min), card.bank, card.last4)
++
++    private fun debit(id: Long, amount: String, min: Long, merchant: String = "CRED Club", text: String = "", bank: String = "Kotak Bank", acct: String? = "1234") =
++        RotationTxn(id, d(amount), merchant, RotationKind.OUTGOING, t0.plusMinutes(min), bank, acct, text)
++
++    private fun credit(id: Long, amount: String, min: Long, merchant: String = "Refund", text: String = "") =
++        RotationTxn(id, d(amount), merchant, RotationKind.INCOMING, t0.plusMinutes(min), "Kotak Bank", "1234", text)
++
++    private fun account(card: CardKey, outstanding: String, asOfMin: Long, limit: String? = "200000") =
++        CardAccount(card.bank, card.last4, d(outstanding), limit?.let { d(it) }, t0.plusMinutes(asOfMin))
++
++    private fun report(
++        txns: List<RotationTxn>, accounts: List<CardAccount> = emptyList(), decisions: Map<Long, PaymentDecision> = emptyMap(),
++        recon: List<Reconciliation> = emptyList(), schedules: List<CardSchedule> = emptyList(), asOfMin: Long = 60L * 24,
++    ) = CardPayments.report(txns, accounts, decisions, recon, schedules, t0.plusMinutes(asOfMin))
++
++    private fun summary(r: PaymentsReport, c: CardKey) = r.cards.first { CardPayments.id(it.card) == CardPayments.id(c) }
++
++    private fun confirm(decisions: Map<Long, PaymentDecision>, t: RotationTxn, card: CardKey, amount: String = t.amount.toPlainString(), minAfter: Long = 5) =
++        CardPayments.confirm(decisions, t, card, d(amount), t0.plusMinutes(minAfter))
++
++    // ---- CRED detection and card selection ------------------------------------------------------
++
++    @Test
++    fun credIsDetected_butCreditAndCreditedAreNot() {
++        assertTrue(CardPayments.isCred(debit(1, "100", 0, merchant = "CRED Club")))
++        assertTrue(CardPayments.isCred(debit(1, "100", 0, merchant = "UPI", text = "paid to cred@axisb")))
++        assertTrue(!CardPayments.isCred(debit(1, "100", 0, merchant = "Credit card bill", text = "amount credited")))
++    }
++
++    @Test
++    fun credAlwaysAsks_evenWhenTheTextNamesACard() {
++        val spendA = spend(1, "50000")
++        val cred = debit(2, "20000", 30, text = "Sent to CRED Club for XX1058")
++        val r = report(listOf(spendA, cred))
++        val row = r.pending.single()
++        assertEquals(PaymentEvidence.CRED, row.evidence)
++        assertEquals(null, row.card)
++        assertEquals(null, row.suggestedCard)
++        assertEquals(PaymentStatus.PENDING, row.status)
++    }
++
++    // ---- two-step confirmation ---------------------------------------------------------------------
++
++    @Test
++    fun previewShowsAmountCardCurrentAndProjectedOutstanding() {
++        val cred = debit(2, "20000", 30)
++        val acct = account(cardA, "50000", 0)
++        val out = CardPayments.outstanding(cardA, listOf(cred), emptyList(), acct, emptyList())
++        val p = CardPayments.preview(cred, cardA, d("20000"), out)
++        assertEquals(d("20000"), p.paymentAmount)
++        assertEquals(cardA, p.card)
++        assertEquals(d("50000"), p.currentOutstanding)
++        assertEquals(d("30000"), p.projectedOutstanding)
++        assertTrue(!p.overpays)
++    }
++
++    @Test
++    fun previewRejectsAmountsThatAreZeroOrAboveTheDebit() {
++        val cred = debit(2, "20000", 30)
++        val out = CardPayments.outstanding(cardA, listOf(cred), emptyList(), account(cardA, "50000", 0), emptyList())
++        var failures = 0
++        for (bad in listOf("0", "20001")) try { CardPayments.preview(cred, cardA, d(bad), out) } catch (e: IllegalArgumentException) { failures++ }
++        assertEquals(2, failures)
++    }
++
++    @Test
++    fun nothingChangesUntilConfirmed_thenOutstandingFallsExactlyOnce() {
++        val cred = debit(2, "20000", 30)
++        val txns = listOf(cred)
++        val acct = listOf(account(cardA, "50000", 0))
++        val before = summary(report(txns, acct), cardA)
++        assertEquals(d("50000"), before.outstanding.amount)
++        assertEquals(d("0"), before.paidAll)
++
++        val decisions = confirm(emptyMap(), cred, cardA)
++        val after = summary(report(txns, acct, decisions), cardA)
++        assertEquals(d("30000"), after.outstanding.amount)
++        assertEquals(d("20000"), after.paidAll)
++    }
++
++    @Test
++    fun confirmingTheSamePaymentTwiceIsRefused() {
++        val cred = debit(2, "20000", 30)
++        val once = confirm(emptyMap(), cred, cardA)
++        var refused = false
++        try { confirm(once, cred, cardB) } catch (e: IllegalStateException) { refused = true }
++        assertTrue(refused)
++    }
++
++    // ---- partial payments and pending payments -------------------------------------------------
++
++    @Test
++    fun partialPaymentReducesByTheConfirmedAmount_andIsNotPaidInFull() {
++        val cred = debit(2, "10000", 30)
++        val acct = listOf(account(cardA, "50000", 0))
++        val decisions = confirm(emptyMap(), cred, cardA, "4000")
++        val s = summary(report(listOf(cred), acct, decisions), cardA)
++        assertEquals(d("46000"), s.outstanding.amount)
++        assertTrue(s.partiallyPaid)
++        assertTrue(!s.paidInFull)
++        val preview = CardPayments.preview(cred, cardA, d("4000"), CardPayments.outstanding(cardA, listOf(cred), emptyList(), acct[0], emptyList()))
++        assertEquals(d("6000"), preview.unallocated)
++    }
++
++    @Test
++    fun pendingPaymentsDoNotTouchAnyBalance() {
++        val rows = listOf(debit(2, "20000", 30), debit(3, "15000", 90))
++        val s = summary(report(rows, listOf(account(cardA, "50000", 0))), cardA)
++        assertEquals(d("50000"), s.outstanding.amount)
++        assertEquals(d("0"), s.paidAll)
++    }
++
++    // ---- one source of truth: never subtracted twice ---------------------------------------------
++
++    @Test
++    fun aPaymentBeforeTheBankFigureIsNotSubtractedAgain_andOneAfterIsSubtractedOnce() {
++        val before = debit(2, "10000", 10)          // already reflected in the bank's figure at minute 20
++        val after = debit(3, "5000", 60)
++        val acct = listOf(account(cardA, "40000", 20))
++        var dec = confirm(emptyMap(), before, cardA)
++        dec = confirm(dec, after, cardA)
++        val s = summary(report(listOf(before, after), acct, dec), cardA)
++        assertEquals(d("35000"), s.outstanding.amount)
++        assertEquals(AnchorKind.BANK_SMS, s.outstanding.anchorKind)
++        assertEquals(d("5000"), s.outstanding.paymentsSince)
++        assertEquals(d("15000"), s.paidAll)
++    }
++
++    @Test
++    fun spendsAfterTheAnchorAdd_andEarlierOnesDoNot() {
++        val old = spend(1, "9999", min = 5)
++        val newer = spend(2, "2500", min = 90)
++        val s = summary(report(listOf(old, newer), listOf(account(cardA, "40000", 30))), cardA)
++        assertEquals(d("42500"), s.outstanding.amount)
++    }
++
++    @Test
++    fun withoutABankFigureTheNumberIsLabelledAnEstimate() {
++        val s = summary(report(listOf(spend(1, "8000"))), cardA)
++        assertTrue(s.outstanding.isEstimate)
++        assertEquals(AnchorKind.NONE, s.outstanding.anchorKind)
++        assertEquals(d("8000"), s.outstanding.amount)
++    }
++
++    // ---- duplicates --------------------------------------------------------------------------------------
++
++    @Test
++    fun aClearDuplicateAcrossSmsAndManualEntryCountsOnce() {
++        val sms = debit(2, "20000", 30)
++        val manual = debit(3, "20000", 32, merchant = "CRED payment", acct = null, bank = "Manual Entry")
++        var dec = confirm(emptyMap(), sms, cardA)
++        dec = confirm(dec, manual, cardA)  // the user (wrongly) confirms both
++        val r = report(listOf(sms, manual), listOf(account(cardA, "50000", 0)), dec)
++        // the user's own decision wins for both, so the app must ask, not silently drop one
++        assertTrue(r.questions.any { it is PaymentQuestion.PossibleDuplicate })
++    }
++
++    @Test
++    fun anUndecidedClearDuplicateIsFlaggedAndNeverReducesOutstandingTwice() {
++        val sms = debit(2, "20000", 30)
++        val manual = debit(3, "20000", 31, merchant = "CRED payment", acct = null, bank = "Manual Entry")
++        val dec = confirm(emptyMap(), sms, cardA)
++        val r = report(listOf(sms, manual), listOf(account(cardA, "50000", 0)), dec)
++        assertEquals(PaymentStatus.DUPLICATE, r.allRows.first { it.txn.id == 3L }.status)
++        assertEquals(d("30000"), summary(r, cardA).outstanding.amount)
++    }
++
++    @Test
++    fun anUncertainDuplicateIsAQuestion_andBothStayPending() {
++        val a = debit(2, "20000", 30, acct = "1234")
++        val b = debit(3, "20000", 300, acct = "9876", bank = "Other Bank")
++        val r = report(listOf(a, b), listOf(account(cardA, "50000", 0)))
++        assertTrue(r.questions.any { it is PaymentQuestion.PossibleDuplicate })
++        assertEquals(2, r.pending.size)
++    }
++
++    @Test
++    fun aSharedReferenceNumberMakesAClearDuplicate() {
++        val a = debit(2, "20000", 30, text = "UPI ref 412345678901")
++        val b = debit(3, "20000", 60 * 20, text = "Imported: ref 412345678901", acct = null, bank = "Imported")
++        val r = report(listOf(a, b))
++        assertEquals(PaymentStatus.DUPLICATE, r.allRows.first { it.txn.id == 3L }.status)
++    }
++
++    // ---- failed and reversed ---------------------------------------------------------------------------------
++
++    @Test
++    fun aPaymentTheBankSaysFailedNeverCounts() {
++        val failed = debit(2, "20000", 30, text = "CRED payment failed, amount will be refunded")
++        val dec = confirm(emptyMap(), failed, cardA)
++        val r = report(listOf(failed), listOf(account(cardA, "50000", 0)), dec)
++        assertEquals(PaymentStatus.FAILED, r.allRows.single().status)
++        assertEquals(d("50000"), summary(r, cardA).outstanding.amount)
++    }
++
++    @Test
++    fun aClearReversalRestoresOutstanding_andKeepsTheHistory() {
++        val pay = debit(2, "20000", 30)
++        val reversal = credit(3, "20000", 60 * 24, merchant = "CRED reversal", text = "Reversal of failed payment")
++        val dec = confirm(emptyMap(), pay, cardA)
++        val r = report(listOf(pay, reversal), listOf(account(cardA, "50000", 0)), dec, asOfMin = 60 * 30)
++        val row = r.allRows.single()
++        assertEquals(PaymentStatus.REVERSED, row.status)
++        assertEquals(d("50000"), summary(r, cardA).outstanding.amount)
++        assertTrue(row.history.any { it.status == PaymentStatus.CONFIRMED })
++        assertTrue(row.history.any { it.status == PaymentStatus.REVERSED })
++    }
++
++    @Test
++    fun anUncertainReversalIsAQuestion_andThePaymentStaysCounted() {
++        val pay = debit(2, "20000", 30)
++        val maybe = credit(3, "20000", 60 * 24, merchant = "UPI credit", text = "from a friend")
++        val dec = confirm(emptyMap(), pay, cardA)
++        val r = report(listOf(pay, maybe), listOf(account(cardA, "50000", 0)), dec, asOfMin = 60 * 30)
++        assertTrue(r.questions.any { it is PaymentQuestion.PossibleReversal })
++        assertEquals(PaymentStatus.CONFIRMED, r.allRows.single().status)
++    }
++
++    @Test
++    fun dismissingReversalEvidenceKeepsThePaymentCounted() {
++        val pay = debit(2, "20000", 30)
++        val reversal = credit(3, "20000", 60 * 24, merchant = "refund", text = "refund")
++        var dec = confirm(emptyMap(), pay, cardA)
++        dec = CardPayments.dismissReversal(dec, 2, t0.plusDays(2))
++        val r = report(listOf(pay, reversal), listOf(account(cardA, "50000", 0)), dec, asOfMin = 60 * 30)
++        assertEquals(PaymentStatus.CONFIRMED, r.allRows.single().status)
++    }
++
++    // ---- history, totals ---------------------------------------------------------------------------------------
++
++    @Test
++    fun unassigningKeepsTheHistory() {
++        val pay = debit(2, "20000", 30)
++        var dec = confirm(emptyMap(), pay, cardA)
++        dec = CardPayments.unassign(dec, 2, t0.plusMinutes(50))
++        val row = report(listOf(pay), decisions = dec).allRows.single()
++        assertEquals(PaymentStatus.PENDING, row.status)
++        assertEquals(2, row.history.size)
++    }
++
++    @Test
++    fun monthlyTotalsCountOnlyConfirmedPaymentsOfThatMonth() {
++        val confirmed = debit(2, "20000", 30)
++        val pending = debit(3, "15000", 60)
++        val failed = debit(4, "7000", 90, text = "payment failed")
++        val lastMonth = debit(5, "9000", -60L * 24 * 40)
++        var dec = confirm(emptyMap(), confirmed, cardA)
++        dec = confirm(dec, failed, cardA)
++        dec = confirm(dec, lastMonth, cardA)
++        val r = report(listOf(confirmed, pending, failed, lastMonth), listOf(account(cardA, "80000", -60L * 24 * 50)), dec)
++        assertEquals(d("20000"), r.confirmedThisMonth)
++        assertEquals(d("20000"), summary(r, cardA).paidMonth)
++        assertEquals(d("29000"), summary(r, cardA).paidAll)
++    }
++
++    // ---- HDFC NetBanking, manual classification ---------------------------------------------------------------
++
++    @Test
++    fun hdfcNetBankingCardPaymentsAreLikelyButNotEveryHdfcDebit() {
++        val likely = debit(2, "12000", 30, merchant = "HDFC NetBanking", text = "Paid towards Credit Card XX1058 via NetBanking", bank = "HDFC Bank")
++        val plain = debit(3, "12000", 90, merchant = "Swiggy", text = "UPI payment", bank = "HDFC Bank")
++        val otherBank = debit(4, "12000", 120, merchant = "NetBanking", text = "NetBanking Credit Card payment", bank = "Kotak Bank")
++        assertEquals(PaymentEvidence.HDFC_NETBANKING, CardPayments.evidenceOf(likely, listOf(cardA)))
++        assertEquals(null, CardPayments.evidenceOf(plain, listOf(cardA)))
++        assertTrue(CardPayments.evidenceOf(otherBank, listOf(cardA)) != PaymentEvidence.HDFC_NETBANKING)
++        val r = report(listOf(likely, plain))
++        assertEquals(listOf(2L), r.pending.map { it.txn.id })  // asked about; the plain debit is not
++    }
++
++    @Test
++    fun aMissedPaymentCanBeClassifiedByHand() {
++        val missed = debit(2, "6000", 30, merchant = "NEFT to J SMITH", text = "NEFT transfer")
++        assertTrue(report(listOf(missed)).allRows.isEmpty())
++        val dec = confirm(emptyMap(), missed, cardA)
++        val r = report(listOf(missed), listOf(account(cardA, "9000", 0)), dec)
++        assertEquals(PaymentEvidence.USER_MARKED, r.allRows.single().evidence)
++        assertEquals(d("3000"), summary(r, cardA).outstanding.amount)
++    }
++
++    @Test
++    fun aCardNamedByItsFullLastFourIsSettledWithoutAskingButTwoMatchingCardsAreNot() {
++        val named = debit(2, "3000", 30, merchant = "Credit Card payment", text = "towards Credit Card XX1058")
++        val r = report(listOf(spend(1, "9000"), named))
++        assertEquals(PaymentStatus.CONFIRMED, r.allRows.single().status)
++        assertEquals(PaymentRow.Basis.EVIDENCE, r.allRows.single().basis)
++        val twin = CardKey("Axis Bank", "1058")
++        assertEquals(null, CardPayments.cardByLast4(named, listOf(cardA, twin)))
++        val partial = debit(3, "3000", 60, merchant = "Credit Card payment", text = "card ending 058")
++        assertEquals(null, CardPayments.cardByLast4(partial, listOf(cardA)))
++    }
++
++    // ---- reconciliation ----------------------------------------------------------------------------------------
++
++    @Test
++    fun reconciliationShowsTheDifference_keepsHistory_andInventsNothing() {
++        val txns = listOf(spend(1, "30000", min = 0))
++        val calculated = CardPayments.outstanding(cardA, txns, emptyList(), null, emptyList())
++        assertEquals(d("30000"), calculated.amount)
++        var hist = CardPayments.reconcile(emptyList(), cardA, d("32500"), t0.plusMinutes(10), calculated.amount)
++        assertEquals(d("2500"), hist.single().difference)
++        hist = CardPayments.reconcile(hist, cardA, d("32500"), t0.plusMinutes(70), d("32500"))
++        assertEquals(2, hist.size)
++        assertEquals(d("0"), hist.last().difference)
++        val s = summary(report(txns, recon = hist), cardA)
++        assertEquals(AnchorKind.RECONCILED, s.outstanding.anchorKind)
++        assertEquals(d("32500"), s.outstanding.amount)
++        assertEquals(1, txns.size)
++        assertEquals(2, s.reconciliations.size)
++    }
++
++    @Test
++    fun theNewestFigureWinsBetweenReconciliationAndBankSms() {
++        val acct = listOf(account(cardA, "40000", 30))
++        val older = CardPayments.reconcile(emptyList(), cardA, d("99999"), t0.plusMinutes(10), d("40000"))
++        assertEquals(d("40000"), summary(report(emptyList(), acct, recon = older), cardA).outstanding.amount)
++        val newer = CardPayments.reconcile(emptyList(), cardA, d("36000"), t0.plusMinutes(90), d("40000"))
++        assertEquals(d("36000"), summary(report(emptyList(), acct, recon = newer), cardA).outstanding.amount)
++    }
++
++    // ---- due dates and reminders -------------------------------------------------------------------------------
++
++    private val sched = CardSchedule(cardA, dueDay = 15, remindDaysBefore = listOf(3, 1))
++    private fun owes(amount: String = "5000") = mapOf(CardPayments.id(cardA) to Outstanding(d(amount), AnchorKind.RECONCILED, t0, false, d("0"), d("0")))
++
++    @Test
++    fun remindersFireBeforeOnAndAfterTheDueDate_onlyOnce() {
++        val sent = HashSet<String>()
++        fun run(day: Int): List<DueAlert> = CardPayments.dueAlerts(listOf(sched), owes(), LocalDate.of(2026, 11, day), sent).also { a -> a.forEach { sent += it.key } }
++        assertEquals(listOf(DueAlertKind.BEFORE), run(12).map { it.kind })
++        assertEquals(emptyList<DueAlert>(), run(12))
++        assertEquals(listOf(DueAlertKind.BEFORE), run(14).map { it.kind })
++        assertEquals(listOf(DueAlertKind.ON_DUE), run(15).map { it.kind })
++        assertEquals(listOf(DueAlertKind.OVERDUE), run(16).map { it.kind })
++        assertEquals(emptyList<DueAlert>(), run(17))
++    }
++
++    @Test
++    fun aClearedCardGetsNoAlerts_butAPartialPaymentDoesNotSilenceThem() {
++        val cleared = mapOf(CardPayments.id(cardA) to Outstanding(d("0"), AnchorKind.RECONCILED, t0, false, d("0"), d("0")))
++        assertTrue(CardPayments.dueAlerts(listOf(sched), cleared, LocalDate.of(2026, 11, 15), emptySet()).isEmpty())
++        assertEquals(1, CardPayments.dueAlerts(listOf(sched), owes("1200"), LocalDate.of(2026, 11, 15), emptySet()).size)
++    }
++
++    @Test
++    fun alertsAreIndependentPerCardAndRespectEachSetting() {
++        val b = CardSchedule(cardB, dueDay = 15, remindDaysBefore = emptyList(), remindOnDue = false, overdueAlerts = false)
++        val both = owes() + (CardPayments.id(cardB) to owes()[CardPayments.id(cardA)]!!)
++        val onDue = CardPayments.dueAlerts(listOf(sched, b), both, LocalDate.of(2026, 11, 15), emptySet())
++        assertEquals(listOf(cardA), onDue.map { it.card })
++        assertTrue(CardPayments.dueAlerts(listOf(CardSchedule(cardA, dueDay = null)), owes(), LocalDate.of(2026, 11, 15), emptySet()).isEmpty())
++    }
++
++    @Test
++    fun dueDayIsClampedToShortMonths() {
++        assertEquals(LocalDate.of(2027, 2, 28), CardPayments.nextDue(31, LocalDate.of(2027, 2, 10)))
++        assertEquals(LocalDate.of(2026, 11, 15), CardPayments.nextDue(15, LocalDate.of(2026, 10, 20)))
++    }
++
++    // ---- persistence: what is saved is exactly what is read back --------------------------------------------
++
++    @Test
++    fun decisionsRoundTrip_includingHistoryAndAwkwardText() {
++        val pay = debit(2, "20000", 30)
++        var dec = confirm(emptyMap(), pay, CardKey("HDFC Bank | Test", "1058"), "15000.50")
++        dec = CardPayments.markStatus(dec, 2, PaymentStatus.REVERSED, t0.plusMinutes(90), "Reversed; ref=5 ~ odd, text | here")
++        dec = CardPayments.dismissReversal(dec, 2, t0.plusMinutes(95))
++        val lines = dec.values.map { PaymentCodec.encode(it) }
++        val back = PaymentCodec.decodeDecisions(lines)
++        assertEquals(dec, back)
++        assertEquals(3, back.getValue(2).history.size)
++    }
++
++    @Test
++    fun pendingDecisionWithNoCardRoundTrips() {
++        val pay = debit(2, "20000", 30)
++        val dec = CardPayments.unassign(confirm(emptyMap(), pay, cardA), 2, t0.plusMinutes(50))
++        assertEquals(dec, PaymentCodec.decodeDecisions(dec.values.map { PaymentCodec.encode(it) }))
++    }
++
++    @Test
++    fun reconciliationsAndSchedulesRoundTrip_andBadLinesAreSkipped() {
++        val rec = Reconciliation(cardA, t0, d("32500.00"), d("30000"), d("2500.00"))
++        assertEquals(rec, PaymentCodec.decodeReconciliation(PaymentCodec.encode(rec)))
++        val sch = CardSchedule(cardB, 31, listOf(7, 3, 1), remindOnDue = false, overdueAlerts = true)
++        assertEquals(sch, PaymentCodec.decodeSchedule(PaymentCodec.encode(sch)))
++        assertEquals(CardSchedule(cardB, null, emptyList(), true, true), PaymentCodec.decodeSchedule(PaymentCodec.encode(CardSchedule(cardB, null, emptyList()))))
++        assertEquals(null, PaymentCodec.decodeDecision("garbage"))
++        assertEquals(null, PaymentCodec.decodeReconciliation("a|b"))
++        assertEquals(null, PaymentCodec.decodeSchedule(""))
++        assertEquals(emptyMap<Long, PaymentDecision>(), PaymentCodec.decodeDecisions(listOf("x", "1|NOPE|||||")))
++    }
++
++    @Test
++    fun restoringTheSameSavedLinesTwiceDoesNotDuplicateAnything() {
++        val pay = debit(2, "20000", 30)
++        val lines = confirm(emptyMap(), pay, cardA).values.map { PaymentCodec.encode(it) }
++        val twice = PaymentCodec.decodeDecisions(lines + lines)
++        assertEquals(1, twice.size)
++    }
++}
 diff --git a/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardRotationTest.kt b/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardRotationTest.kt
 new file mode 100644
-index 00000000..02696f3e
+index 00000000..a4b09ce8
 --- /dev/null
 +++ b/app/src/test/java/com/pennywiseai/tracker/domain/rotation/CardRotationTest.kt
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,516 @@
 +package com.pennywiseai.tracker.domain.rotation
 +
 +import org.junit.Assert.assertEquals
@@ -2366,27 +4074,34 @@ index 00000000..02696f3e
 +        )
 +        val asOf = t0.plusHours(3)
 +        val report = CardRotation.analyze(rows, asOf = asOf)
-+        val accounts = listOf(CardAccount("HDFC", "4321", BigDecimal("45000"), BigDecimal("200000")))
-+        val d = CardDashboard.build(rows, accounts, report, asOf)
++        val accounts = listOf(CardAccount("HDFC", "4321", BigDecimal("45000"), BigDecimal("200000"), asOf))
++        val payments = CardPayments.report(rows, accounts, emptyMap(), emptyList(), emptyList(), asOf)
++        val d = CardDashboard.build(rows, report, payments, asOf)
 +        val hdfc = d.cards.first { it.card.last4 == "4321" }
 +        assertEquals(BigDecimal("52484.10"), hdfc.spentAll)
 +        assertEquals(BigDecimal("51284.10"), hdfc.spentMonth)
 +        assertEquals(BigDecimal("20000"), hdfc.paidAll)
-+        assertEquals(BigDecimal("45000"), hdfc.outstanding)
++        assertEquals(BigDecimal("45000"), hdfc.outstanding.amount)
++        assertEquals(AnchorKind.BANK_SMS, hdfc.outstanding.anchorKind)
 +        assertEquals(23, hdfc.usedPercent) // 45,000 of 200,000 = 22.5%, rounded half up
 +        assertEquals(BigDecimal("584.10"), hdfc.rotationCharges)
 +        assertTrue(hdfc.activity.any { it.kind == ActivityKind.ROTATION_SPEND })
 +        assertTrue(hdfc.activity.any { it.kind == ActivityKind.ROTATION_CREDIT })
 +        assertTrue(hdfc.activity.any { it.kind == ActivityKind.ROTATION_ONWARD })
++        assertTrue(hdfc.activity.any { it.kind == ActivityKind.PAYMENT && it.status == PaymentStatus.CONFIRMED })
 +        val other = d.cards.first { it.card.last4 == "9999" }
 +        assertEquals(BigDecimal("50000"), other.paidAll)
++        assertTrue(other.outstanding.isEstimate)
++        assertEquals(null, other.usedPercent) // an estimate is never shown as an exact utilisation
 +    }
 +
 +    @Test
-+    fun paymentsWithNoMatchingCard_areCountedAsUnassigned() {
-+        val rows = listOf(spend(1, "5000", merchant = "Shop"), debit(2, "4000", 60, text = "Credit Card bill XX0001"))
-+        val d = CardDashboard.build(rows, emptyList(), CardRotation.analyze(rows, asOf = t0.plusDays(1)), t0)
-+        assertEquals(BigDecimal("4000"), d.unassignedPaid)
++    fun aCardBillPaymentWithNoCardNamedWaitsForConfirmation() {
++        val rows = listOf(spend(1, "5000", merchant = "Shop"), debit(2, "4000", 60, text = "Credit Card bill payment"))
++        val payments = CardPayments.report(rows, emptyList(), emptyMap(), emptyList(), emptyList(), t0)
++        val d = CardDashboard.build(rows, CardRotation.analyze(rows, asOf = t0.plusDays(1)), payments, t0)
++        assertEquals(BigDecimal("4000"), d.pendingAmount)
++        assertEquals(BigDecimal.ZERO, d.cards.single().paidAll)
 +    }
 +
 +    @Test
@@ -2400,28 +4115,28 @@ index 00000000..02696f3e
 +        }
 +        val start = System.nanoTime()
 +        val report = CardRotation.analyze(rows, asOf = t0.plusDays(100000))
-+        CardDashboard.build(rows, emptyList(), report, t0.plusDays(100000))
++        CardDashboard.build(rows, report, CardPayments.report(rows, emptyList(), emptyMap(), emptyList(), emptyList(), t0.plusDays(100000)), t0.plusDays(100000))
 +        val ms = (System.nanoTime() - start) / 1_000_000
 +        println("18000 rows analysed in $ms ms")
 +        assertTrue(ms < 2000)
 +    }
 +
-+    /** Real pattern: card bills are paid through CRED, whose SMS never names the card. */
 +    @Test
-+    fun credPayments_areCardBillsAndCanBeAssignedByHand() {
++    fun credPayments_areCardBillsThatNeedTheUsersCardChoice() {
 +        val rows = listOf(
 +            spend(1, "58000", merchant = "Upi-87237950304"),
 +            debit(2, "57000", 300, merchant = "CRED Club", text = "Sent Rs.57000 To CRED Club"),
 +        )
 +        val report = CardRotation.analyze(rows, asOf = t0.plusDays(1))
 +        assertTrue(report.suggestions.single().looksLikeCardBill)
-+        val before = CardDashboard.build(rows, emptyList(), report, t0.plusDays(1))
-+        assertEquals(1, before.unassigned.size)
-+        assertEquals(BigDecimal.ZERO, before.cards.single().paidAll)
++        val before = CardPayments.report(rows, emptyList(), emptyMap(), emptyList(), emptyList(), t0.plusDays(1))
++        assertEquals(1, before.pending.size)
++        assertEquals(BigDecimal.ZERO, CardDashboard.build(rows, report, before, t0.plusDays(1)).cards.single().paidAll)
 +        val card = before.cards.single().card
-+        val after = CardDashboard.build(rows, emptyList(), report, t0.plusDays(1), assignments = mapOf(2L to card))
-+        assertTrue(after.unassigned.isEmpty())
-+        assertEquals(BigDecimal("57000"), after.cards.single().paidAll)
++        val decisions = CardPayments.confirm(emptyMap(), rows[1], card, BigDecimal("57000"), t0.plusDays(1))
++        val after = CardPayments.report(rows, emptyList(), decisions, emptyList(), emptyList(), t0.plusDays(1))
++        assertTrue(after.pending.isEmpty())
++        assertEquals(BigDecimal("57000"), CardDashboard.build(rows, report, after, t0.plusDays(1)).cards.single().paidAll)
 +    }
 +
 +    /** Real pattern: 30,000 credited, 28,172.90 sent to CRED (94%). */
@@ -2529,6 +4244,15 @@ index 00000000..02696f3e
 +        // two days later the spend is simply still unmatched and still asked about
 +        val r = CardRotation.analyze(listOf(spend(1, "30500")), asOf = t0.plusDays(2))
 +        assertEquals(listOf(1L), r.needsCredit.map { it.outId })
++    }
++
++    @Test
++    fun smallSpendWithASimilarDebitIsNotSuggested_untilTheThresholdIsLowered() {
++        // 2,000 on the card and 2,000 out of the bank three minutes later, no fee: an everyday coincidence
++        val card = spend(1, "2000", merchant = "Some shop")
++        val debit = RotationTxn(2, BigDecimal("2000"), "UPI payment", RotationKind.OUTGOING, t0.plusMinutes(3), "OwnBank", "2222")
++        assertTrue(CardRotation.analyze(listOf(card, debit), asOf = t0.plusDays(1)).suggestions.isEmpty())
++        assertEquals(1, CardRotation.analyze(listOf(card, debit), askMinAmount = BigDecimal.ZERO, asOf = t0.plusDays(1)).suggestions.size)
 +    }
 +}
 diff --git a/parser-core/src/main/kotlin/com/pennywiseai/parser/core/bank/HSBCBankParser.kt b/parser-core/src/main/kotlin/com/pennywiseai/parser/core/bank/HSBCBankParser.kt
